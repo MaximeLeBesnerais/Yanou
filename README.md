@@ -60,7 +60,6 @@ into the device's Downloads folder.
 | `app/rust/crates/core` | WireGuard engine, transport/obfuscation, Mullvad API client |
 | `PORT-PLAN.md` | feasibility study, milestones, roadmap, UI backlog |
 | `ANDROID-PATH-REPORT.md` | line-by-line trace of the official Android client's connect path |
-| `docs/` | sample diagnostics log |
 
 `source/` is **not** part of this repository: it is a sparse checkout of
 [mullvad/mullvadvpn-app](https://github.com/mullvad/mullvadvpn-app) used while writing the
