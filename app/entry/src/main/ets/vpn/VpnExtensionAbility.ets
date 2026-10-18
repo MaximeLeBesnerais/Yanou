@@ -47,6 +47,8 @@ const STALL_MS: number = 90000;
  * the relay stopped answering even though the engine is still sending keepalives.
  */
 const HANDSHAKE_STALE_MS: number = 240000;
+/** What the engine reports for "this peer has no session at all". */
+const NO_HANDSHAKE_AGE_MS: number = 3600000;
 /** Minimum gap between automatic rebuilds, so a flapping relay cannot spin the ladder. */
 const REBUILD_GAP_MS: number = 2000;
 
@@ -462,8 +464,10 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
     if (status.handshakeAgeMs >= HANDSHAKE_STALE_MS) {
       // The engine keeps sending keepalives into a dead relay, so the byte counters still
       // move; only the age of the last key exchange separates that from a healthy tunnel.
-      this.markLost(`No key exchange with the relay for ` +
-        `${Math.round(status.handshakeAgeMs / 1000)} s`);
+      // The engine reports the sentinel when the peer has no session left at all.
+      this.markLost(status.handshakeAgeMs >= NO_HANDSHAKE_AGE_MS ?
+        'the relay session expired' :
+        `No key exchange with the relay for ${Math.round(status.handshakeAgeMs / 1000)} s`);
       return;
     }
     const progress: number = status.udpSent + status.udpRecv + status.rxBytes + status.txBytes;

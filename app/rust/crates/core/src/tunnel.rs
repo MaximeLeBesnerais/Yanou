@@ -44,6 +44,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
 /// Reported instead of a real age when this session has never completed a key exchange.
 const NO_HANDSHAKE_AGE_MS: u64 = 3_600_000;
+/// When to ask for a fresh key exchange.
+///
+/// WireGuard rejects a session that has not rekeyed within 180 s, and gotatun only
+/// rekeys when real payload flows, so a tunnel nobody is using dies after three quiet
+/// minutes. Asking just before that keeps an idle tunnel usable.
+const REKEY_AFTER_MS: u64 = 100_000;
 
 /// Counts packets coming out of WireGuard, so the UI can tell "blocking" from "tunnelling".
 #[derive(Clone)]
@@ -321,6 +327,11 @@ pub extern "C" fn mh_tunnel_start(
                 }
                 RX_BYTES.store(rx, Ordering::Relaxed);
                 TX_BYTES.store(tx, Ordering::Relaxed);
+                if age_ms >= REKEY_AFTER_MS && age_ms < REKEY_AFTER_MS + 1000 {
+                    // Only the tick that crosses the threshold asks, so a failing relay is
+                    // retried by the handshake task rather than flooded from here.
+                    let _ = stats_device.force_handshake(&relay_key).await;
+                }
                 HANDSHAKE_AGE_MS.store(age_ms, Ordering::Relaxed);
                 if handshake && !HANDSHAKE.swap(true, Ordering::SeqCst) {
                     log_line("tunnel: handshake confirmed by peer stats");
