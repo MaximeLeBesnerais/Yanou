@@ -1,0 +1,26 @@
+# Upstream checkout used as a reference; not part of this project.
+source/
+
+# Local scratch: screenshots, pulled logs, downloaded relay lists.
+tmp/
+
+# HarmonyOS build output and tool caches.
+app/.hvigor/
+app/.idea/
+app/oh_modules/
+app/entry/oh_modules/
+app/build/
+app/entry/build/
+app/entry/.preview/
+app/entry/libs/
+
+# Rust build output and the vendored cargo home.
+app/rust/target/
+app/rust/.cargo/
+
+# Signing material must never be committed: it is device-bound and contains secrets.
+app/build-profile.json5
+
+# Logs and OS noise.
+*.log
+.DS_Store

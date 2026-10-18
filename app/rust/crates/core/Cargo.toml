@@ -1,0 +1,40 @@
+[package]
+name = "muharmony-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# OpenHarmony is a first-class target in this crate: with target_env = "ohos" it uses
+# src/platform/ohos, which takes the fd the system vNIC hands back and wraps it in a
+# posix Tun. That is the same shape Android uses, only without JNI.
+tun = { version = "0.8.14", default-features = false, features = ["async"] }
+gotatun = { version = "0.10.1", default-features = false, features = ["aws-lc-rs", "device", "tun"] }
+ipnetwork = "0.21"
+base64 = "0.22"
+rand = "0.8"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+# The API has to be reachable from a network that poisons api.mullvad.net. The only way
+# in is Mullvad's own domain-fronting tunnel through CDN77, which is a Rust protocol
+# (a POST/GET pair multiplexed per session), not something the system HTTP stack can do.
+domain-fronting = { version = "0.2.0", features = ["tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+webpki-roots = "1"
+
+# Mullvad relays are unreachable over plain WireGuard on a filtered network: the relay IPs
+# are dropped outright. Mullvad's own answer is obfuscation through a bridge relay, using
+# Shadowsocks AEAD in UDP mode. Same crate and cipher their client uses.
+bytes = "1"
+shadowsocks = { version = "1.25.0", default-features = false, features = ["aead-cipher", "stream-cipher"] }

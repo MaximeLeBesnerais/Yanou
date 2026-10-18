@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "keep_running_reason",
+      "value": "Keep the VPN tunnel running while the app is in the background"
+    },
+    {
+      "name": "module_desc",
+      "value": "MuHarmony VPN client"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "MuHarmony"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "MuHarmony"
+    },
+    {
+      "name": "vpn_ability_label",
+      "value": "MuHarmony tunnel"
+    },
+    {
+      "name": "vpn_tunnel_reason",
+      "value": "Routes device traffic through the MuHarmony tunnel"
+    }
+  ]
+}
