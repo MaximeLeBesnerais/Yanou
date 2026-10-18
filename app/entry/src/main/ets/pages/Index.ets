@@ -1304,6 +1304,15 @@ struct Index {
   }
 
   private async startTunnel(): Promise<void> {
+    // Cold start: the extension publishes its state once a second, so the UI can still be
+    // looking at an empty field when this runs. Wait for one publication before deciding.
+    if (this.lastStateAt === 0) {
+      await new Promise<void>((resolve: () => void) => {
+        setTimeout(() => {
+          resolve();
+        }, 1300);
+      });
+    }
     // The tunnel runs in its own process and survives the UI process. Reopening the app must
     // not tear a healthy tunnel down and dial again, which is what the reconnect-on-open was.
     if (this.phase === 'connected' || this.phase === 'connecting') {
