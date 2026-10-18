@@ -35,6 +35,10 @@ static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 /// stopped answering while the engine keeps sending keepalives". A live session rekeys
 /// every couple of minutes, so a large age means nothing is coming back any more.
 static HANDSHAKE_AGE_MS: AtomicU64 = AtomicU64::new(3_600_000);
+/// Which families to forward: bit 1 IPv4, bit 2 IPv6. Default is both.
+static IP_VERSION: AtomicU64 = AtomicU64::new(FAMILY_IPV4 | FAMILY_IPV6);
+const FAMILY_IPV4: u64 = 1;
+const FAMILY_IPV6: u64 = 2;
 static JOBS: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new());
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
@@ -252,16 +256,24 @@ pub extern "C" fn mh_tunnel_start(
         let async_device = tun::AsyncDevice::new(device).map_err(|error| error.to_string())?;
         let tun_device = TunDevice::from_tun_device(async_device).map_err(|error| error.to_string())?;
 
+        // A family that is not selected is still routed into the tun by the system, but it
+        // is left out of the peer's allowed IPs, so gotatun drops it instead of forwarding
+        // it. That is leak protection: it fails inside the tunnel, never on the carrier.
+        let families = IP_VERSION.load(Ordering::SeqCst);
         let mut allowed_ips = Vec::new();
-        for network in [
-            ipnetwork::IpNetwork::new(Ipv4Addr::UNSPECIFIED.into(), 0),
-            ipnetwork::IpNetwork::new(Ipv6Addr::UNSPECIFIED.into(), 0),
-        ] {
-            match network {
+        if families & FAMILY_IPV4 != 0 {
+            match ipnetwork::IpNetwork::new(Ipv4Addr::UNSPECIFIED.into(), 0) {
                 Ok(network) => allowed_ips.push(network),
                 Err(error) => log_line(&format!("tunnel: bad allowed ip: {error}")),
             }
         }
+        if families & FAMILY_IPV6 != 0 {
+            match ipnetwork::IpNetwork::new(Ipv6Addr::UNSPECIFIED.into(), 0) {
+                Ok(network) => allowed_ips.push(network),
+                Err(error) => log_line(&format!("tunnel: bad allowed ip: {error}")),
+            }
+        }
+        log_line(&format!("tunnel: forwarding families 0x{families:x}"));
 
         let mut relay = Peer::new(relay_key)
             .with_endpoint(endpoint)
@@ -386,6 +398,13 @@ pub extern "C" fn mh_tunnel_stop() {
     HANDSHAKE.store(false, Ordering::SeqCst);
     HANDSHAKE_AGE_MS.store(NO_HANDSHAKE_AGE_MS, Ordering::SeqCst);
     log_line("tunnel: stopped");
+}
+
+#[no_mangle]
+pub extern "C" fn mh_set_ip_version(families: c_int) {
+    let value = families as u64 & (FAMILY_IPV4 | FAMILY_IPV6);
+    // Forwarding nothing would be a black hole with the VPN still claiming to be up.
+    IP_VERSION.store(if value == 0 { FAMILY_IPV4 } else { value }, Ordering::SeqCst);
 }
 
 #[no_mangle]

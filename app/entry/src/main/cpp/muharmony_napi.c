@@ -32,6 +32,7 @@ extern int32_t mh_tunnel_start(int32_t fd, int32_t mtu, const char* peer_key, co
 extern int32_t mh_tunnel_status(char* out, int32_t capacity);
 extern void mh_tunnel_stop(void);
 extern void mh_set_diagnostics(int32_t enabled);
+extern void mh_set_ip_version(int32_t families);
 extern int32_t mh_log_marker(const char* text);
 extern int32_t mh_log_line(const char* text);
 extern void mh_stop(void);
@@ -256,6 +257,21 @@ static napi_value WrapSetDiagnostics(napi_env env, napi_callback_info info)
     return result;
 }
 
+static napi_value WrapSetIpVersion(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = { 0 };
+    napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+    int32_t families = 3;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &families);
+    }
+    mh_set_ip_version(families);
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
+}
+
 static napi_value WrapTunnelStart(napi_env env, napi_callback_info info)
 {
     size_t argc = 6;
@@ -441,6 +457,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "tunnelStatus", NULL, WrapTunnelStatus, NULL, NULL, NULL, napi_default, NULL },
         { "tunnelStop", NULL, WrapTunnelStop, NULL, NULL, NULL, napi_default, NULL },
         { "setDiagnostics", NULL, WrapSetDiagnostics, NULL, NULL, NULL, napi_default, NULL },
+        { "setIpVersion", NULL, WrapSetIpVersion, NULL, NULL, NULL, napi_default, NULL },
         { "logMarker", NULL, WrapLogMarker, NULL, NULL, NULL, napi_default, NULL },
         { "logLine", NULL, WrapLogLine, NULL, NULL, NULL, napi_default, NULL },
     };

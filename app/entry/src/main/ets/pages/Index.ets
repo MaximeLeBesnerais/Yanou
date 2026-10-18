@@ -1093,6 +1093,40 @@ struct Index {
     }
   }
 
+  private async setPrefText(key: string, value: string): Promise<void> {
+    try {
+      await VpnSettings.setString(getContext(this) as common.Context, key, value);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'setting %{public}s failed', key);
+    }
+  }
+
+  @Builder
+  ipOption(label: string, value: string) {
+    Button(label)
+      .fontSize(13)
+      .height(34)
+      .padding({ left: 14, right: 14 })
+      .backgroundColor(this.prefs.ipVersion === value ?
+        $r('sys.color.brand') : Color.Transparent)
+      .border({
+        width: 1,
+        color: this.prefs.ipVersion === value ? $r('sys.color.brand') : $r('sys.color.comp_divider')
+      })
+      .fontColor(this.prefs.ipVersion === value ? Color.White : $r('sys.color.font_primary'))
+      .onClick(() => {
+        this.prefs.ipVersion = value;
+        this.setPrefText('ipVersion', value);
+        // Excluding a family turns blocking on: without it the system routes that family
+        // around the tunnel and the connections are reset on the carrier. Keep the switch
+        // honest rather than blocking behind its back.
+        if (value !== 'auto' && !this.prefs.killSwitch) {
+          this.prefs.killSwitch = true;
+          this.setPref('killSwitch', true);
+        }
+      })
+  }
+
   /** Ordered relays to try for the current selection. */
   private candidatesForSelection(): RelayItem[] {
     if (this.selection === null) {
@@ -1196,9 +1230,13 @@ struct Index {
   }
 
   private vpnWant(): Want {
-    const ipv6: string = this.session === null || !this.prefs.ipv6 ? '' : this.session.ipv6;
+    // The IPv6 address is always claimed, whatever the mode: it is what installs the ::/0
+    // route, and the family that is not forwarded still has to be routed into the tunnel
+    // so the engine can drop it instead of letting it escape unprotected.
+    const ipv6: string = this.session === null ? '' : this.session.ipv6;
     const parameters: Record<string, Object> = {
       'ipv6': ipv6,
+      'ipVersion': this.prefs.ipVersion,
       'killSwitch': this.prefs.killSwitch,
       'target': this.relayLabel(),
       'relayIp': this.selection !== null && this.selection.kind === 'relay' ?
@@ -1405,10 +1443,20 @@ struct Index {
       return `Trying ${target} · traffic is blocked meanwhile`;
     }
     if (this.phase === 'connected') {
-      const routed: string = this.prefs.ipv6 ? 'IPv4 + IPv6 routed' : 'IPv4 routed';
-      return `${formatUptime(this.uptimeMs)} · ${routed}`;
+      return `${formatUptime(this.uptimeMs)} · ${this.ipModeLabel()} routed`;
     }
     return 'Traffic leaves the device unprotected';
+  }
+
+  /** What the tunnel carries, in the words the cards use. */
+  private ipModeLabel(): string {
+    if (this.prefs.ipVersion === 'ipv6') {
+      return 'IPv6 only';
+    }
+    if (this.prefs.ipVersion === 'auto') {
+      return 'IPv4 + IPv6';
+    }
+    return 'IPv4 only';
   }
 
   private keyMismatch(): boolean {
@@ -1799,7 +1847,7 @@ struct Index {
             Text(`vNIC ${this.session?.ipv4 ?? '-'} · MTU 1420 · DNS 10.64.0.1`)
               .fontSize(13)
               .fontColor($r('sys.color.font_tertiary'))
-            Text(`IPv6 ${this.prefs.ipv6 ? 'on' : 'off'} · kill switch ${this.prefs.killSwitch ? 'on' : 'off'}`)
+            Text(`${this.ipModeLabel()} · kill switch ${this.prefs.killSwitch ? 'on' : 'off'}`)
               .fontSize(13)
               .fontColor($r('sys.color.font_tertiary'))
           }
@@ -3728,27 +3776,27 @@ struct Index {
 
             Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
 
-            Row() {
+            Column({ space: 8 }) {
               Column({ space: 2 }) {
-                Text('IPv6')
+                Text('Device IP version')
                   .fontSize(15)
                   .fontColor($r('sys.color.font_primary'))
-                Text('Claim the IPv6 address assigned to this device')
+                Text('The other family is dropped inside the tunnel and blocked on the carrier')
                   .fontSize(12)
                   .fontColor($r('sys.color.font_secondary'))
               }
               .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
+              .width('100%')
 
-              Toggle({ type: ToggleType.Switch, isOn: this.prefs.ipv6 })
-                .selectedColor($r('sys.color.brand'))
-                .onChange((isOn: boolean) => {
-                  this.prefs.ipv6 = isOn;
-                  this.setPref('ipv6', isOn);
-                })
+              Row({ space: 8 }) {
+                this.ipOption('IPv4 only', 'ipv4')
+                this.ipOption('IPv6 only', 'ipv6')
+                this.ipOption('Both', 'auto')
+              }
+              .width('100%')
             }
             .width('100%')
-            .height(60)
+            .padding({ top: 12, bottom: 12 })
 
             Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
 

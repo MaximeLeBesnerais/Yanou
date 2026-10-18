@@ -96,6 +96,12 @@ export const tunnelStop: () => void;
 /** Diagnostics logging is opt-in; off by default. */
 export const setDiagnostics: (enabled: boolean) => void;
 
+/**
+ * Which address families the engine forwards: 1 IPv4, 2 IPv6, 3 both. The family that is
+ * left out is dropped inside the tunnel instead of leaving the device unprotected.
+ */
+export const setIpVersion: (families: number) => void;
+
 /** Starts a new diagnostics section (one per connection attempt). */
 export const logMarker: (title: string) => void;
 

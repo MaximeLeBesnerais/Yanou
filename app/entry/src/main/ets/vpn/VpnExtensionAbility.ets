@@ -104,6 +104,8 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
   private tunnelIpv4: string = '';
   /** Public key the account registered for this device. */
   private expectKey: string = '';
+  /** "ipv4", "ipv6" or "auto": which family the engine forwards. */
+  private ipVersion: string = 'ipv4';
   /** Transport ladder for this connection, chosen by the protocol preference. */
   private ladder: string[] = LADDER;
   private rxBytes: number = 0;
@@ -139,6 +141,8 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
       params['relayKey'] as string : '';
     this.tunnelIpv4 = params !== undefined && params['tunnelIpv4'] !== undefined ?
       params['tunnelIpv4'] as string : '';
+    this.ipVersion = params !== undefined && params['ipVersion'] !== undefined ?
+      params['ipVersion'] as string : 'ipv4';
     this.expectKey = params !== undefined && params['expectKey'] !== undefined ?
       params['expectKey'] as string : '';
     const diagnostics: boolean = params !== undefined && params['diagnostics'] !== undefined ?
@@ -166,6 +170,11 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
   private async setup(ipv6Cidr: string, killSwitch: boolean): Promise<void> {
     try {
       native.init(this.context.filesDir);
+      // Bit 1 is IPv4, bit 2 is IPv6. The engine forwards only the selected family; the
+      // other one is still routed into the tun by the system, so it is dropped there
+      // instead of leaving the device unprotected.
+      const families: number = this.ipVersion === 'ipv6' ? 2 : (this.ipVersion === 'auto' ? 3 : 1);
+      native.setIpVersion(families);
       // Must precede the marker: logging is opt-in per process, and this process has its
       // own copy of the native library with its own flag.
       native.setDiagnostics(this.diagnostics);
@@ -243,13 +252,18 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
         mtu: TUN_MTU,
         isIPv4Accepted: true,
         isIPv6Accepted: ipv6Cidr.length > 0,
-        isBlocking: killSwitch
+        // IPv4-only is a promise, not a preference: the family that is not forwarded has to
+        // be blocked on the carrier too, or the system keeps routing app IPv6 around the
+        // tunnel and those connections are reset by the network. Blocking mode is what
+        // enforces that, so it stays on whenever a family is excluded.
+        isBlocking: killSwitch || this.ipVersion !== 'auto'
       };
 
       this.tunnelFd = await this.connection.create(config);
       hilog.info(DOMAIN, TAG, 'tun fd=%{public}d', this.tunnelFd);
       native.logLine(`vpn config: tun fd ${this.tunnelFd} · mtu ${TUN_MTU} · dns ${TUN_DNS} · ` +
-        `ipv6 ${ipv6Cidr.length > 0 ? ipv6Cidr : 'off'} · killSwitch ${killSwitch} · ` +
+        `ipv6 ${ipv6Cidr.length > 0 ? ipv6Cidr : 'off'} · families ${this.ipVersion} · ` +
+        `killSwitch ${killSwitch} · ` +
         `own traffic goes through the tunnel (protect() covers the engine socket)`);
       native.logLine(`candidates: ${this.candidates.length} from ${this.target}`);
 

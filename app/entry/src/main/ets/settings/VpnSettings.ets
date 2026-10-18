@@ -4,7 +4,12 @@ import { common } from '@kit.AbilityKit';
 /** Tunnel options that belong to the user, not to the account. */
 export interface VpnPrefs {
   killSwitch: boolean;
-  ipv6: boolean;
+  /**
+   * Which address family the tunnel carries: "ipv4", "ipv6" or "auto" for both. The other
+   * family is still routed into the tunnel but the engine drops it, so it fails fast
+   * instead of escaping unprotected.
+   */
+  ipVersion: string;
   multihop: boolean;
   dnsBlocking: boolean;
   /** Allow the unfronted API path. Off keeps api.mullvad.net out of DNS and SNI. */
@@ -15,7 +20,9 @@ export interface VpnPrefs {
 
 export const DEFAULT_PREFS: VpnPrefs = {
   killSwitch: false,
-  ipv6: true,
+  // IPv4 first: a device whose IPv6 path is filtered would otherwise hang on every
+  // dual-stack name for seconds before falling back.
+  ipVersion: 'ipv4',
   multihop: false,
   dnsBlocking: false,
   directAllowed: false,
@@ -28,9 +35,13 @@ export class VpnSettings {
   static async load(context: common.Context): Promise<VpnPrefs> {
     try {
       const store = await preferences.getPreferences(context, STORE_NAME);
+      const ipVersion: string = await store.get('ipVersion', DEFAULT_PREFS.ipVersion) as string;
+      const killSwitch: boolean = await store.get('killSwitch', DEFAULT_PREFS.killSwitch) as boolean;
       return {
-        killSwitch: await store.get('killSwitch', DEFAULT_PREFS.killSwitch) as boolean,
-        ipv6: await store.get('ipv6', DEFAULT_PREFS.ipv6) as boolean,
+        // A single-family mode blocks the other family on the carrier, which is what the
+        // kill switch does; reporting it off would hide that.
+        killSwitch: killSwitch || ipVersion !== 'auto',
+        ipVersion: ipVersion,
         multihop: await store.get('multihop', DEFAULT_PREFS.multihop) as boolean,
         dnsBlocking: await store.get('dnsBlocking', DEFAULT_PREFS.dnsBlocking) as boolean,
         directAllowed: await store.get('directAllowed', DEFAULT_PREFS.directAllowed) as boolean,
