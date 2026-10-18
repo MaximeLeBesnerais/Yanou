@@ -1304,6 +1304,12 @@ struct Index {
   }
 
   private async startTunnel(): Promise<void> {
+    // The tunnel runs in its own process and survives the UI process. Reopening the app must
+    // not tear a healthy tunnel down and dial again, which is what the reconnect-on-open was.
+    if (this.phase === 'connected' || this.phase === 'connecting') {
+      hilog.info(0x0000, 'MuHarmony', 'startTunnel skipped: already %{public}s', this.phase);
+      return;
+    }
     if (this.busy) {
       return;
     }
