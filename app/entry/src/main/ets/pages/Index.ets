@@ -804,10 +804,16 @@ struct Index {
             this.retrying = false;
             this.forceHostname = '';
           }
-          if (this.phase === 'connected' || this.phase === 'connecting') {
+          if (this.phase === 'connected' || this.phase === 'connecting' ||
+            this.phase === 'lost') {
+            // "lost" means the extension is rebuilding the tunnel itself: the continuous
+            // task must survive that, or the rebuild happens without the keep-alive.
             this.startKeepAlive();
-          } else if (this.phase === 'idle' || this.phase === 'failed' || this.phase === 'lost') {
+          } else if (this.phase === 'idle' || this.phase === 'failed') {
             this.stopKeepAlive();
+          }
+          if (this.phase === 'lost' && previousPhase !== 'lost') {
+            this.retrying = true;
           }
           if (this.phase === 'failed' && previousPhase !== 'failed' && this.retrying) {
             this.attemptAutoReconnect();

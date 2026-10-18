@@ -80,13 +80,19 @@ export interface TunnelStatus {
   /** Datagrams the engine actually wrote / read on the relay socket. */
   udpSent: number;
   udpRecv: number;
+  /**
+   * Milliseconds since the last successful key exchange, capped at one hour. A live
+   * session rekeys every couple of minutes, so a large value means the relay stopped
+   * answering even while the engine keeps sending keepalives.
+   */
+  handshakeAgeMs: number;
   error: string;
 }
 
 export function parseTunnelStatus(raw: string): TunnelStatus {
   const fallback: TunnelStatus = {
     running: false, handshake: false, inbound: false, rxBytes: 0, txBytes: 0,
-    udpSent: 0, udpRecv: 0, error: ''
+    udpSent: 0, udpRecv: 0, handshakeAgeMs: 3600000, error: ''
   };
   if (raw.length === 0) {
     return fallback;

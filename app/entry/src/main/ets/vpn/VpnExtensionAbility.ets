@@ -35,6 +35,20 @@ const BRIDGE_SS_PORT: number = 1236;
 const ATTEMPT_MS: number = 5000;
 /** How long the ladder keeps trying before the connection is reported as failed. */
 const BUDGET_MS: number = 180000;
+/**
+ * How long a tunnel that calls itself connected may move no traffic at all before it is
+ * declared dead. WireGuard sends a keepalive every 25 s, so an idle tunnel still moves
+ * datagrams; a minute and a half of complete silence means the session is gone.
+ */
+const STALL_MS: number = 90000;
+/**
+ * How old the last key exchange may get before the tunnel counts as dead. WireGuard
+ * rekeys every ~2 minutes while it is moving traffic, so four minutes without one means
+ * the relay stopped answering even though the engine is still sending keepalives.
+ */
+const HANDSHAKE_STALE_MS: number = 240000;
+/** Minimum gap between automatic rebuilds, so a flapping relay cannot spin the ladder. */
+const REBUILD_GAP_MS: number = 2000;
 
 /**
  * Transport ladder, mirroring the official client's `RETRY_ORDER`: the plain IPv6 path
@@ -98,6 +112,15 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
   private endpoint: string = '';
   /** Time from `tunnel: device up` to the handshake confirmation; 0 until it happens. */
   private handshakeMs: number = 0;
+  /** Last activity figure seen on a live tunnel, and when it last moved. */
+  private lastProgress: number = -1;
+  private lastProgressAt: number = 0;
+  /** Set when the supervisor has decided the tunnel is dead and a rebuild is due. */
+  private rebuildPending: boolean = false;
+  private rebuilds: number = 0;
+  private lastRebuildAt: number = 0;
+  /** Why the tunnel was declared lost; republished every tick so the UI keeps it. */
+  private lostReason: string = '';
 
   onCreate(want: Want): void {
     hilog.info(DOMAIN, TAG, 'onCreate %{public}s', want.abilityName);
@@ -184,17 +207,26 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
       let ipv6Address: string = '';
       if (ipv6Cidr.length > 0) {
         const parts: string[] = ipv6Cidr.split('/');
-        const prefix: number = parts.length > 1 ? Number.parseInt(parts[1], 10) : 128;
+        const declared: number = parts.length > 1 ? Number.parseInt(parts[1], 10) : 128;
+        // A /128 host route is rejected for the vNIC, and the system then quietly keeps the
+        // interface IPv4-only. A /64 is the smallest prefix that gets the address installed.
+        const prefix: number = declared < 64 ? 64 : declared;
         ipv6Address = parts[0];
-        addresses.push({
+        // The v6 address goes in first: the vNIC comes up IPv6-capable only when the IPv6
+        // entry is present, and the earlier order made the system apply IPv4 and drop v6.
+        addresses.unshift({
           address: { address: ipv6Address, family: 2 },
           prefixLength: prefix
         });
         // The address alone does not route v6 into the tunnel; ::/0 has to be claimed too.
+        // The next hop is the unspecified address, not the vNIC's own /128: it is ignored
+        // when `hasGateway` is false, and handing the interface its own address as a
+        // gateway made the system drop this route silently, so IPv6 left the device
+        // unprotected and the network reset every TLS handshake to a v6 address.
         routes.push({
           interface: 'vpn-tun',
           destination: { address: { address: '::', family: 2 }, prefixLength: 0 },
-          gateway: { address: ipv6Address, family: 2 },
+          gateway: { address: '::', family: 2 },
           hasGateway: false,
           isDefaultRoute: true
         });
@@ -387,6 +419,9 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
         hilog.info(DOMAIN, TAG, 'handshake confirmed after %{public}d ms', this.handshakeMs);
         native.logLine(`result: connected (${this.target})`);
         this.phase = 'connected';
+        // A fresh session starts the stall clock from now, not from the last one.
+        this.lastProgress = -1;
+        this.lastProgressAt = Date.now();
         this.publish();
       } else if (Date.now() - this.connectStartedAt > BUDGET_MS) {
         this.fail(`${this.target} did not complete a handshake within ` +
@@ -399,8 +434,87 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
         native.tunnelStop();
         this.startCandidate();
       }
+    } else if (this.phase === 'connected') {
+      // Nothing used to watch a live tunnel, so a dead one kept reporting "connected"
+      // and the user only found out when a page refused to load.
+      this.supervise();
+    } else if (this.phase === 'lost' && this.rebuildPending) {
+      this.rebuildPending = false;
+      this.rebuild();
     }
+    this.publish(this.phase === 'lost' ? this.lostReason : '');
+  }
+
+  /**
+   * Watches a live tunnel. WireGuard sends a keepalive every 25 s and the engine counts
+   * every datagram it moves, so a session that stops moving is gone even while the
+   * process, the tun fd and the UI all still look perfectly healthy.
+   */
+  private supervise(): void {
+    const status: TunnelStatus = parseTunnelStatus(native.tunnelStatus());
+    this.rxBytes = status.rxBytes;
+    this.txBytes = status.txBytes;
+    const now: number = Date.now();
+    if (this.ticks % 60 === 0) {
+      hilog.info(DOMAIN, TAG, 'tunnel health: last key exchange %{public}d s ago',
+        Math.round(status.handshakeAgeMs / 1000));
+    }
+    if (status.handshakeAgeMs >= HANDSHAKE_STALE_MS) {
+      // The engine keeps sending keepalives into a dead relay, so the byte counters still
+      // move; only the age of the last key exchange separates that from a healthy tunnel.
+      this.markLost(`No key exchange with the relay for ` +
+        `${Math.round(status.handshakeAgeMs / 1000)} s`);
+      return;
+    }
+    const progress: number = status.udpSent + status.udpRecv + status.rxBytes + status.txBytes;
+    if (progress !== this.lastProgress) {
+      this.lastProgress = progress;
+      this.lastProgressAt = now;
+      return;
+    }
+    if (this.lastProgressAt === 0) {
+      this.lastProgressAt = now;
+      return;
+    }
+    if (now - this.lastProgressAt >= STALL_MS) {
+      this.markLost(`No traffic through the tunnel for ${Math.round(STALL_MS / 1000)} s`);
+    }
+  }
+
+  /** Declares a connected tunnel dead and schedules a rebuild on the next tick. */
+  private markLost(reason: string): void {
+    const now: number = Date.now();
+    if (this.phase !== 'connected' || now - this.lastRebuildAt < REBUILD_GAP_MS) {
+      return;
+    }
+    this.lastRebuildAt = now;
+    this.rebuilds += 1;
+    hilog.warn(DOMAIN, TAG, 'tunnel dropped: %{public}s', reason);
+    native.logLine(`result: lost · ${reason} · rebuild #${this.rebuilds}`);
+    this.lostReason = reason;
+    this.lastProgress = -1;
+    this.lastProgressAt = 0;
+    this.phase = 'lost';
+    // Stop the dead engine now, but rebuild on the next tick: the UI and the notification
+    // then have a full second to show what happened before the ladder starts again.
+    native.tunnelStop();
+    this.rebuildPending = true;
+  }
+
+  /** Re-dials the ladder on the tun this ability still owns, without asking the user. */
+  private rebuild(): void {
+    if (this.connection === undefined) {
+      return;
+    }
+    hilog.info(DOMAIN, TAG, 'rebuilding tunnel (#%{public}d)', this.rebuilds);
+    native.logLine(`rebuild #${this.rebuilds}: re-dialling the ladder`);
+    this.phase = 'connecting';
+    this.connectStartedAt = Date.now();
+    this.attemptStartedAt = Date.now();
+    this.handshakeMs = 0;
+    this.lostReason = '';
     this.publish();
+    this.startCandidate();
   }
 
   /** Ends the attempt and releases the system VPN so the next Connect can start clean. */
@@ -455,6 +569,10 @@ export default class MuharmonyVpnAbility extends VpnExtensionAbility {
     native.logLine(`result: stopped (${this.phase})`);
     this.candidates = [];
     this.candidateIndex = 0;
+    this.rebuildPending = false;
+    this.lastProgress = -1;
+    this.lastProgressAt = 0;
+    this.lostReason = '';
     // Nothing is dialled any more; an idle payload must not describe the last attempt.
     this.transport = '';
     this.family = '';

@@ -29,6 +29,12 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 static HANDSHAKE: AtomicBool = AtomicBool::new(false);
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static TX_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Age of the most recent key exchange, capped at an hour.
+///
+/// This is the only signal that separates "the tunnel is alive but idle" from "the relay
+/// stopped answering while the engine keeps sending keepalives". A live session rekeys
+/// every couple of minutes, so a large age means nothing is coming back any more.
+static HANDSHAKE_AGE_MS: AtomicU64 = AtomicU64::new(3_600_000);
 static JOBS: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new());
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
@@ -36,6 +42,8 @@ static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Peer statistics are cheap; polling them keeps the counters live in the UI.
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
+/// Reported instead of a real age when this session has never completed a key exchange.
+const NO_HANDSHAKE_AGE_MS: u64 = 3_600_000;
 
 /// Counts packets coming out of WireGuard, so the UI can tell "blocking" from "tunnelling".
 #[derive(Clone)]
@@ -302,15 +310,18 @@ pub extern "C" fn mh_tunnel_start(
                 let mut rx = 0u64;
                 let mut tx = 0u64;
                 let mut handshake = false;
+                let mut age_ms: u64 = NO_HANDSHAKE_AGE_MS;
                 for entry in &peers {
                     rx = rx.saturating_add(entry.stats.rx_bytes as u64);
                     tx = tx.saturating_add(entry.stats.tx_bytes as u64);
-                    if entry.stats.last_handshake.is_some() {
+                    if let Some(age) = entry.stats.last_handshake {
                         handshake = true;
+                        age_ms = age_ms.min(age.as_millis() as u64);
                     }
                 }
                 RX_BYTES.store(rx, Ordering::Relaxed);
                 TX_BYTES.store(tx, Ordering::Relaxed);
+                HANDSHAKE_AGE_MS.store(age_ms, Ordering::Relaxed);
                 if handshake && !HANDSHAKE.swap(true, Ordering::SeqCst) {
                     log_line("tunnel: handshake confirmed by peer stats");
                 }
@@ -362,6 +373,7 @@ pub extern "C" fn mh_tunnel_stop() {
         std::thread::sleep(Duration::from_millis(80));
     }
     HANDSHAKE.store(false, Ordering::SeqCst);
+    HANDSHAKE_AGE_MS.store(NO_HANDSHAKE_AGE_MS, Ordering::SeqCst);
     log_line("tunnel: stopped");
 }
 
@@ -376,6 +388,7 @@ pub extern "C" fn mh_tunnel_status(out: *mut c_char, capacity: c_int) -> c_int {
         "inbound": HANDSHAKE.load(Ordering::SeqCst),
         "rxBytes": RX_BYTES.load(Ordering::Relaxed),
         "txBytes": TX_BYTES.load(Ordering::Relaxed),
+        "handshakeAgeMs": HANDSHAKE_AGE_MS.load(Ordering::Relaxed),
         "error": error,
     });
     write_out(out, capacity, &payload.to_string())
