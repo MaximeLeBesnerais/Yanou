@@ -118,6 +118,9 @@ struct Index {
   /** Last time the tunnel process published anything, used to detect a silent drop. */
   private lastStateAt: number = 0;
   private watchdog: number = -1;
+  /** The page is foreground; the state broadcasts are suspended in background. */
+  private visible: boolean = true;
+  private visibleAt: number = 0;
   /** Notification actions from EntryAbility (`disconnect` / `reconnect`). */
   @StorageLink('notificationAction') @Watch('onNotificationAction') notificationAction: string = '';
   private notificationKey: string = '';
@@ -179,6 +182,15 @@ struct Index {
   /** Protocol preference (`auto` / `direct` / `obfuscated`); the tunnel reads the same key. */
   @State protocolMode: string = 'auto';
 
+  onPageShow(): void {
+    this.visible = true;
+    this.visibleAt = Date.now();
+  }
+
+  onPageHide(): void {
+    this.visible = false;
+  }
+
   aboutToAppear(): void {
     // The native core needs its files directory for the key and the relay cache. Doing
     // this here rather than in signIn() means a restored session can fetch relays too.
@@ -188,6 +200,7 @@ struct Index {
     this.restoreSession();
     this.restoreSelection();
     this.subscribeState();
+    this.visibleAt = Date.now();
     this.watchdog = setInterval(() => {
       this.checkLiveness();
     }, 2000);
@@ -680,7 +693,6 @@ struct Index {
     this.tunnelTarget = '';
     this.errorText = reason;
     this.retrying = true;
-    this.stopKeepAlive();
     this.refreshNotification();
     this.attemptAutoReconnect();
   }
@@ -701,6 +713,7 @@ struct Index {
     }
     this.retrying = false;
     this.phase = 'failed';
+    this.stopKeepAlive();
     this.errorText = 'Every relay failed after the connection was lost.';
     this.refreshNotification();
     this.publishFailureNotification();
@@ -755,6 +768,11 @@ struct Index {
    */
   private checkLiveness(): void {
     if (this.phase !== 'connected' && this.phase !== 'connecting') {
+      return;
+    }
+    // Backgrounded pages do not receive broadcasts; never read that silence as a
+    // dead tunnel. After resume, give the next publish five seconds to arrive.
+    if (!this.visible || Date.now() - this.visibleAt < 5000) {
       return;
     }
     if (this.lastStateAt === 0 || Date.now() - this.lastStateAt < 5000) {
