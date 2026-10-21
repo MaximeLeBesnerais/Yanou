@@ -558,26 +558,38 @@ pub extern "C" fn mh_negotiate_daita(
 
     let result = match outcome {
         Ok(negotiated) => {
-            log_line(&format!(
-                "daita: relay returned {} machine(s), max padding {:.3}, max blocking {:.3}",
-                negotiated.machines.len(),
-                negotiated.max_padding,
-                negotiated.max_blocking
-            ));
-            let payload = json!({
-                "ok": true,
-                // DAITA alone does not get a PSK; the field is left empty so the caller
-                // has one shape whether PQ is negotiated later or not.
-                "psk": "",
-                "machines": negotiated.machines,
-                "maxPadding": negotiated.max_padding,
-                "maxBlocking": negotiated.max_blocking,
-                "ephemeralKey": ephemeral_private.unwrap_or_default(),
-                "ephemeralPublicKey": ephemeral_public_b64,
-                "platform": DAITA_PLATFORM_LINUX_WG_GO,
-                "version": DAITA_VERSION,
-            });
-            write_json(out, capacity, &payload)
+            // Parse the machines here as well: a response that cannot become a
+            // `DaitaSettings` is a failed negotiation, not something to restart into.
+            match negotiated.settings() {
+                Ok(_) => {
+                    log_line(&format!(
+                        "daita: relay returned {} machine(s), max padding {:.3}, max blocking {:.3}",
+                        negotiated.machines.len(),
+                        negotiated.max_padding,
+                        negotiated.max_blocking
+                    ));
+                    let payload = json!({
+                        "ok": true,
+                        // DAITA alone does not get a PSK; the field is left empty so the
+                        // caller has one shape whether PQ is negotiated later or not.
+                        "psk": "",
+                        "machines": negotiated.machines,
+                        "maxPadding": negotiated.max_padding,
+                        "maxBlocking": negotiated.max_blocking,
+                        // The private half is handed back only because the core is
+                        // stateless between NAPI calls; it is a throwaway session key.
+                        "ephemeralKey": ephemeral_private.unwrap_or_default(),
+                        "ephemeralPublicKey": ephemeral_public_b64,
+                        "platform": DAITA_PLATFORM_LINUX_WG_GO,
+                        "version": DAITA_VERSION,
+                    });
+                    write_json(out, capacity, &payload)
+                }
+                Err(error) => {
+                    log_line(&format!("daita: unusable relay config: {error}"));
+                    write_json(out, capacity, &json!({"ok": false, "error": error}))
+                }
+            }
         }
         Err(error) => {
             log_line(&format!("daita: negotiation failed: {error}"));
