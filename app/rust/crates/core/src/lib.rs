@@ -32,6 +32,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 mod api;
 mod daita;
+mod dns;
 mod transports;
 mod tunnel;
 

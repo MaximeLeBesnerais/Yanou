@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::dns::DnsRedirect;
 use crate::transports::TransportFactory;
 use crate::{api::runtime, log_line, note_started, write_out};
 
@@ -151,6 +152,12 @@ struct TunnelSettings {
     /// cannot complete the handshake the service prepared.
     #[serde(default, rename = "ephemeralKey")]
     ephemeral_key: Option<String>,
+    /// Resolver every plaintext IPv4 DNS query is rewritten to, so content blocking does
+    /// not depend on the platform resolver using `VpnConfig.dnsAddresses`. Optional: a
+    /// private custom resolver is reachable only outside the tunnel and is omitted by the
+    /// extension, which leaves the DNS redirect off.
+    #[serde(default)]
+    dns: Option<String>,
 }
 
 /// A parsed DAITA request, ready to be attached to the peer that terminates the tunnel.
@@ -329,6 +336,67 @@ fn parse_source_v4(raw: &Option<String>) -> Ipv4Addr {
         .map(|text| text.split('/').next().unwrap_or_default().trim())
         .and_then(|text| text.parse().ok())
         .unwrap_or(Ipv4Addr::UNSPECIFIED)
+}
+
+/// The resolver the tunnel itself answers on: the gateway of the tunnel subnet.
+///
+/// It looks like an RFC1918 address, but it is reached through the relay, not the physical
+/// network, so it is the one private-looking address the redirect must accept.
+const TUNNEL_RESOLVER: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 1);
+
+/// True for addresses a resolver reachable only outside the tunnel would use.
+fn is_local_resolver(address: Ipv4Addr) -> bool {
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || address.is_broadcast()
+}
+
+/// Decides whether the in-tunnel DNS redirect can be enabled for this attempt.
+///
+/// The extension already omits private custom resolvers, but the core validates its own
+/// input: sending every query to an address the relay cannot reach would break DNS
+/// completely, which is worse than leaving the platform resolver alone. A malformed value
+/// is not fatal for the same reason — the tunnel still works without the redirect.
+fn resolve_dns_redirect(settings: &TunnelSettings) -> Option<Ipv4Addr> {
+    let Some(raw) = settings
+        .dns
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        log_line("dns: no resolver for the in-tunnel redirect (private resolver or none chosen)");
+        return None;
+    };
+    let address: IpAddr = match raw.parse() {
+        Ok(address) => address,
+        Err(error) => {
+            log_line(&format!("dns: ignoring resolver '{raw}': {error}"));
+            return None;
+        }
+    };
+    match address {
+        IpAddr::V4(address) if address == TUNNEL_RESOLVER || !is_local_resolver(address) => {
+            log_line(&format!(
+                "dns: in-tunnel redirect to {address}; only IPv4 DNS is redirected, IPv6 DNS passes unchanged"
+            ));
+            Some(address)
+        }
+        IpAddr::V4(address) => {
+            log_line(&format!(
+                "dns: {address} is loopback or private, no in-tunnel redirect"
+            ));
+            None
+        }
+        IpAddr::V6(address) => {
+            log_line(&format!(
+                "dns: {address} is IPv6, only IPv4 DNS is redirected; no in-tunnel redirect"
+            ));
+            None
+        }
+    }
 }
 
 /// Builds the peer for the entry or the exit relay.
@@ -568,6 +636,9 @@ pub extern "C" fn mh_tunnel_start(
             return write_out(out, capacity, &json!({"ok": false, "error": error}).to_string())
         }
     };
+    // Content blocking cannot rely on the platform resolver here, so plaintext IPv4 DNS is
+    // rewritten inside the tunnel when the extension named a resolver it can reach.
+    let dns_resolver = resolve_dns_redirect(&parsed_settings);
     if let Some(daita) = daita.as_ref() {
         log_line(&format!(
             "tunnel: daita on, {} maybenot machine(s), max padding {:.3}, max blocking {:.3}, \
@@ -672,6 +743,10 @@ pub extern "C" fn mh_tunnel_start(
         let device = tun::create(&config).map_err(|error| error.to_string())?;
         let async_device = tun::AsyncDevice::new(device).map_err(|error| error.to_string())?;
         let tun_device = TunDevice::from_tun_device(async_device).map_err(|error| error.to_string())?;
+        // Every packet crosses this layer on its way between the tun and the engine. The
+        // exit device of a multihop chain faces the same tun, so the redirect wraps that
+        // device too; the entry device only carries WireGuard datagrams.
+        let tun = DnsRedirect::new(ObservedTun { inner: tun_device }, dns_resolver);
 
         // A family that is not selected is still routed into the tun by the system, but it
         // is left out of the peer's allowed IPs, so gotatun drops it instead of forwarding
@@ -738,7 +813,7 @@ pub extern "C" fn mh_tunnel_start(
                 let exit_device = Arc::new(
                     DeviceBuilder::new()
                         .with_udp(udp_channels)
-                        .with_ip(ObservedTun { inner: tun_device })
+                        .with_ip(tun)
                         .with_private_key(StaticSecret::from(daita_secret))
                         .with_peer(exit_config)
                         .build()
@@ -840,7 +915,7 @@ pub extern "C" fn mh_tunnel_start(
 
                 let device = Arc::new(
                     DeviceBuilder::new()
-                        .with_ip(ObservedTun { inner: tun_device })
+                        .with_ip(tun)
                         .with_udp(transport)
                         .with_private_key(StaticSecret::from(daita_secret))
                         .with_peer(relay)
@@ -1083,6 +1158,41 @@ mod tests {
         );
         let settings = parse_settings(&raw).expect("settings parse");
         assert!(resolve_exit(&settings).expect("exit parse").is_some());
+    }
+
+    #[test]
+    fn dns_redirect_is_off_without_the_setting() {
+        let settings = parse_settings("{}").expect("settings parse");
+        assert!(resolve_dns_redirect(&settings).is_none());
+    }
+
+    #[test]
+    fn dns_redirect_accepts_the_tunnel_resolvers_and_public_ones() {
+        // 100.64.0.1 is the blocking resolver (CGNAT, not RFC1918) and 10.64.0.1 is the
+        // tunnel's own gateway: both are answered from inside the tunnel.
+        for (raw, expected) in [
+            (r#"{"dns":"100.64.0.1"}"#, Ipv4Addr::new(100, 64, 0, 1)),
+            (r#"{"dns":"10.64.0.1"}"#, TUNNEL_RESOLVER),
+            (r#"{"dns":"1.1.1.1"}"#, Ipv4Addr::new(1, 1, 1, 1)),
+        ] {
+            let settings = parse_settings(raw).expect("settings parse");
+            assert_eq!(resolve_dns_redirect(&settings), Some(expected), "rejected {raw}");
+        }
+    }
+
+    #[test]
+    fn dns_redirect_rejects_a_private_loopback_or_ipv6_resolver() {
+        for raw in [
+            r#"{"dns":"192.168.1.1"}"#,
+            r#"{"dns":"172.16.0.1"}"#,
+            r#"{"dns":"127.0.0.1"}"#,
+            r#"{"dns":"169.254.1.1"}"#,
+            r#"{"dns":"2606:4700:4700::1111"}"#,
+            r#"{"dns":"not-an-ip"}"#,
+        ] {
+            let settings = parse_settings(raw).expect("settings parse");
+            assert_eq!(resolve_dns_redirect(&settings), None, "accepted {raw}");
+        }
     }
 
     /// The "no-op" machine from the maybenot crate's own documentation.
