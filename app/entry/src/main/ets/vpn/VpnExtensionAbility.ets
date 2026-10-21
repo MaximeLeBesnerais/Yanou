@@ -54,19 +54,19 @@ const REBUILD_GAP_MS: number = 2000;
 
 /**
  * One rung of the transport ladder: which family to dial, and how the datagrams are
- * carried to the relay — plain UDP, LWO over the relay, Shadowsocks through a bridge, or
- * a TCP stream with udp2tcp.
+ * carried to the relay — plain UDP, LWO over the relay, Shadowsocks through a bridge, a
+ * TCP stream with udp2tcp, or MASQUE through a QUIC proxy.
  */
 interface TransportDescriptor {
   /** Stable name used in diagnostics; one transport may have one entry per family. */
   id: string;
   /** Which transport the native core builds for this attempt. */
-  kind: 'direct' | 'shadowsocks' | 'lwo' | 'udp2tcp';
+  kind: 'direct' | 'shadowsocks' | 'lwo' | 'udp2tcp' | 'quic';
   family: 'v4' | 'v6';
   /**
    * True when the attempt hides WireGuard: Shadowsocks through a bridge, LWO over the
-   * relay itself, or udp2tcp inside a TCP stream. The protocol preference keeps only
-   * these in obfuscated mode.
+   * relay itself, udp2tcp inside a TCP stream, or MASQUE inside QUIC. The protocol
+   * preference keeps only these in obfuscated mode.
    */
   obfuscated: boolean;
 }
@@ -94,8 +94,10 @@ function lwoVersionOf(candidate: RelayCandidate): number {
  * Every entry is retried with a fresh port and, once the relay list is exhausted, a
  * fresh relay.
  *
- * The protocol preference filters this table. Adding a transport is one entry here plus
- * the code that dials it — never another branch in `startCandidate`.
+ * QUIC comes last: it only exists on relays that publish `features.quic`, and QUIC on
+ * 443 is the narrowest door the relays offer. The protocol preference filters this table.
+ * Adding a transport is one entry here plus the code that dials it — never another branch
+ * in `startCandidate`.
  */
 const TRANSPORTS: TransportDescriptor[] = [
   { id: 'direct-v6', kind: 'direct', family: 'v6', obfuscated: false },
@@ -105,7 +107,9 @@ const TRANSPORTS: TransportDescriptor[] = [
   { id: 'lwo-v6', kind: 'lwo', family: 'v6', obfuscated: true },
   { id: 'shadowsocks-v6', kind: 'shadowsocks', family: 'v6', obfuscated: true },
   { id: 'udp2tcp-v4', kind: 'udp2tcp', family: 'v4', obfuscated: true },
-  { id: 'udp2tcp-v6', kind: 'udp2tcp', family: 'v6', obfuscated: true }
+  { id: 'udp2tcp-v6', kind: 'udp2tcp', family: 'v6', obfuscated: true },
+  { id: 'quic-v4', kind: 'quic', family: 'v4', obfuscated: true },
+  { id: 'quic-v6', kind: 'quic', family: 'v6', obfuscated: true }
 ];
 /** Shadowsocks ports published by the relay list (`wireguard.shadowsocks_port_ranges`). */
 const SS_PORT_MIN: number = 51900;
@@ -118,11 +122,23 @@ const SS_PORT_MAX: number = 51949;
 const UDP2TCP_PORTS: number[] = [80, 443, 5001];
 /** Port of the relay's own WireGuard listener, seen from inside the obfuscated tunnel. */
 const INNER_WG_PORT: number = 51820;
+/**
+ * Port of the MASQUE proxy: it pretends to be an ordinary HTTPS server, so it is 443 and
+ * not a WireGuard port.
+ */
+const QUIC_PROXY_PORT: number = 443;
 
 /** Per-transport settings the native core reads from `settings` in `tunnelStart`. */
 interface Udp2TcpSettings {
   /** Relay TCP port for this udp2tcp attempt; one of UDP2TCP_PORTS. */
   port: number;
+}
+
+/** The MASQUE settings the core needs: proxy address, SNI/authority and relay token. */
+interface QuicSettings {
+  addr: string;
+  domain: string;
+  token: string;
 }
 
 /**
@@ -393,7 +409,45 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       const settings: Udp2TcpSettings = { port: port };
       return JSON.stringify(settings);
     }
+    if (entry.kind === 'quic') {
+      const quic: RelayQuic | undefined = candidate.quic;
+      if (quic === undefined || quic === null) {
+        return '';
+      }
+      const addr: string = this.quicAddress(quic, entry.family === 'v6');
+      const domain: string = quic.domain !== undefined && quic.domain !== null ? quic.domain : '';
+      const token: string = quic.token !== undefined && quic.token !== null ? quic.token : '';
+      if (addr.length === 0 || domain.length === 0 || token.length === 0) {
+        return '';
+      }
+      // The native side dials addr:443, uses domain as the TLS SNI (and the HTTP
+      // authority), and puts token in the CONNECT request's Authorization header.
+      const settings: QuicSettings = { addr: addr, domain: domain, token: token };
+      return JSON.stringify(settings);
+    }
     return '';
+  }
+
+  /**
+   * The QUIC proxy address for one family, or '' when the relay publishes none.
+   *
+   * `features.quic.addr_in` mixes both families, and the relay's own addresses appear
+   * there only when they also serve as proxy addresses, so this list is the only source
+   * for the address to dial. One is picked at random, like the official relay selector
+   * does, so retries spread over the addresses instead of always hitting the first.
+   */
+  private quicAddress(quic: RelayQuic, v6: boolean): string {
+    const addresses: string[] = quic.addr !== undefined && quic.addr !== null ? quic.addr : [];
+    const matching: string[] = [];
+    for (const address of addresses) {
+      if (address.includes(':') === v6) {
+        matching.push(address);
+      }
+    }
+    if (matching.length === 0) {
+      return '';
+    }
+    return matching[Math.floor(Math.random() * matching.length)];
   }
 
   /**
@@ -435,11 +489,12 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       const wantsV6: boolean = entry.family === 'v6';
       const isUdp2Tcp: boolean = entry.kind === 'udp2tcp';
       const isShadowsocks: boolean = entry.kind === 'shadowsocks';
+      const isQuic: boolean = entry.kind === 'quic';
       const ipv6: string = candidate.ipv6 !== undefined && candidate.ipv6 !== null ?
         candidate.ipv6 : '';
-      if (wantsV6 && ipv6.length === 0) {
-        // The only capability udp2tcp needs is an address in the family being dialled:
-        // its TCP ports are hardcoded, not published per relay.
+      // A relay without its own IPv6 address has nothing to dial over v6. QUIC is the
+      // exception: it dials a proxy address the relay publishes, not the relay's own.
+      if (wantsV6 && ipv6.length === 0 && !isQuic) {
         continue;
       }
       // LWO is only dialled when the relay advertises it. Skipping the rung costs one
@@ -448,14 +503,27 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       if (entry.kind === 'lwo' && lwoVersion === 0) {
         continue;
       }
-      // Only Shadowsocks goes through a bridge; LWO and udp2tcp talk to the relay's own
-      // address.
-      const endpointIp: string = wantsV6 ? ipv6 : candidate.ip;
+      // QUIC dials a proxy address the relay publishes, and only has one when it carries
+      // `features.quic`. A rung that does not apply to this relay is skipped, which is
+      // what keeps the other transports working unchanged.
+      const quic: RelayQuic | undefined = candidate.quic;
+      let quicAddr: string = '';
+      if (isQuic) {
+        if (quic === undefined || quic === null) {
+          continue;
+        }
+        quicAddr = this.quicAddress(quic, wantsV6);
+        if (quicAddr.length === 0) {
+          continue;
+        }
+      }
+      const endpointIp: string = isQuic ? quicAddr : (wantsV6 ? ipv6 : candidate.ip);
       const family: number = wantsV6 ? 6 : 4;
-      // Each transport has its own port chain: udp2tcp's three TCP ports, the bridge's
-      // Shadowsocks range, or the published WireGuard UDP ranges.
-      const port: number = isUdp2Tcp ? this.nextUdp2TcpPort() :
-        (isShadowsocks ? this.nextShadowsocksPort() : this.nextPort());
+      // Each transport has its own port: the proxy's HTTPS port for QUIC, udp2tcp's three
+      // TCP ports, the bridge's Shadowsocks range, or the published WireGuard UDP ranges.
+      const port: number = isQuic ? QUIC_PROXY_PORT :
+        (isUdp2Tcp ? this.nextUdp2TcpPort() :
+          (isShadowsocks ? this.nextShadowsocksPort() : this.nextPort()));
       // Shadowsocks goes to a dedicated address when the relay publishes one; the relay's
       // own address is the one that gets blackholed. udp2tcp has no such list: the relay
       // itself listens for it, so it must use the relay's own address.
@@ -465,6 +533,12 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         extra[Math.floor(Math.random() * extra.length)] : endpointIp;
       const hostPort: string = host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
       const bridge: string = isShadowsocks ? hostPort : '';
+      const settings: string = this.transportSettings(entry, candidate, port);
+      if (isQuic && settings.length === 0) {
+        // A relay that publishes `features.quic` without a usable token, SNI or address is
+        // a broken entry, not a network problem: skip it instead of spending an attempt.
+        continue;
+      }
 
       this.target = candidate.hostname;
       // Record what this attempt is before dialling, so a payload published mid-attempt
@@ -492,17 +566,18 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         native.logLine(`relay socket not available (${relayFd})`);
       }
 
-      // Shadowsocks and udp2tcp carry the datagrams to the relay's own loopback listener;
-      // LWO wraps them in place, so the peer endpoint is the address actually dialled.
+      // Shadowsocks and udp2tcp deliver to the relay's own loopback listener on 51820;
+      // LWO wraps the datagrams in place and QUIC dials the proxy, so both keep the port
+      // they actually dial.
       const wireguardPort: number = (isShadowsocks || isUdp2Tcp) ? INNER_WG_PORT : port;
       const started = JSON.parse(native.tunnelStart(this.tunnelFd, TUN_MTU, candidate.publicKey,
-        endpointIp, wireguardPort, bridge, entry.kind,
-        this.transportSettings(entry, candidate, port))) as Record<string, Object>;
+        endpointIp, wireguardPort, bridge, entry.kind, settings)) as Record<string, Object>;
       hilog.info(DOMAIN, TAG, 'attempt %{public}s %{public}s', candidate.hostname,
         JSON.stringify(started));
       const route: string = isShadowsocks ? `shadowsocks via ${host}` :
         (isUdp2Tcp ? 'udp2tcp' :
-          (entry.kind === 'lwo' ? `lwo v${lwoVersion}` : 'direct'));
+          (isQuic ? `quic via ${quicAddr}` :
+            (entry.kind === 'lwo' ? `lwo v${lwoVersion}` : 'direct')));
       native.logLine(`attempt ${this.candidateIndex}: ${candidate.hostname} ` +
         `${hostPort} ipv${family} ${route}`);
       if (started['ok'] === true) {

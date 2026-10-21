@@ -2,15 +2,16 @@
 //!
 //! One module per transport, each implementing [`Transport`]: `direct` is plain UDP to the
 //! relay, `shadowsocks` wraps every datagram for a bridge relay, `lwo` obfuscates the
-//! WireGuard header for a relay that advertises it, and `udp2tcp` frames the datagrams into
-//! a TCP stream. QUIC lands here as a sibling module and plugs into [`TransportFactory`],
-//! without touching the engine.
+//! WireGuard header for a relay that advertises it, `udp2tcp` frames the datagrams into a
+//! TCP stream, and `quic` carries them as MASQUE CONNECT-UDP datagrams through a QUIC
+//! proxy. Each plugs into [`TransportFactory`] without touching the engine.
 //!
 //! The socket is created by the extension and `protect()`ed, so it bypasses the tunnel the
 //! engine is building.
 
 mod direct;
 mod lwo;
+mod quic;
 mod shadowsocks;
 mod udp2tcp;
 
@@ -201,6 +202,12 @@ impl TransportFactory {
                     Box::new(lwo::Lwo::new(async_udp(socket)?, relay, peer_key, settings)?)
                 }
                 RelaySocket::Tcp(_) => return Err("lwo needs a UDP relay socket".into()),
+            },
+            "quic" => match socket {
+                RelaySocket::Udp(socket) => {
+                    Box::new(quic::Quic::new(async_udp(socket)?, relay, settings)?)
+                }
+                RelaySocket::Tcp(_) => return Err("quic needs a UDP relay socket".into()),
             },
             other => return Err(format!("unknown transport '{other}'")),
         };

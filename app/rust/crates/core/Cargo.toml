@@ -44,3 +44,9 @@ shadowsocks = { version = "1.25.0", default-features = false, features = ["aead-
 # crate published on crates.io is not this code. No features: only the library's
 # framing and forwarder are used, not the `udp2tcp`/`tcp2udp` binaries.
 udp-over-tcp = { git = "https://github.com/mullvad/udp-over-tcp", rev = "06e6438d3a2537786efde7185f5675ce5e38d45e" }
+
+# QUIC/MASQUE. When WireGuard is blocked but QUIC on UDP 443 is not, datagrams go through
+# the relay's MASQUE proxy. The crate is a member of Mullvad's workspace and is not
+# published, so it is vendored under app/rust/vendor/masque-proxy (GPL-3.0-or-later) and
+# brings quinn, h3 and its own MASQUE framing with it.
+mullvad-masque-proxy = { path = "../../vendor/masque-proxy" }
