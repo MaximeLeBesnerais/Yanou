@@ -7,7 +7,9 @@ import { RelayQuic, WireGuardKey } from '../api/MullvadApi';
 import {
   VpnStatePayload, TunnelStatus, parseTunnelStats, parseTunnelStatus, VPN_STATE_EVENT
 } from '../common/VpnEvents';
-import { VpnSettings } from '../settings/VpnSettings';
+import {
+  VpnPrefs, VpnSettings, isLocalDnsAddress, isValidDnsAddress
+} from '../settings/VpnSettings';
 
 const DOMAIN = 0x0001;
 const TAG = 'YanouVpn';
@@ -20,6 +22,19 @@ const TAG = 'YanouVpn';
 const TUN_GATEWAY: string = '10.64.0.1';
 const TUN_DNS: string = '10.64.0.1';
 const TUN_MTU: number = 1420;
+/**
+ * Automatic-mode content blocking: one resolver, 100.64.0.0 with a bit per blocked
+ * category in the last octet. The bit values are the daemon's
+ * (`mullvad-daemon/src/dns.rs`), so the relay answers the same way it does for the
+ * official client: ads only is 100.64.0.1, ads and trackers is 100.64.0.3.
+ */
+const DNS_BLOCKING_BASE: string = '100.64.0.';
+const DNS_BLOCK_ADS: number = 1 << 0;
+const DNS_BLOCK_TRACKERS: number = 1 << 1;
+const DNS_BLOCK_MALWARE: number = 1 << 2;
+const DNS_BLOCK_ADULT: number = 1 << 3;
+const DNS_BLOCK_GAMBLING: number = 1 << 4;
+const DNS_BLOCK_SOCIAL: number = 1 << 5;
 /**
  * Ports to try against a relay, in order.
  *
@@ -51,6 +66,99 @@ const HANDSHAKE_STALE_MS: number = 240000;
 const NO_HANDSHAKE_AGE_MS: number = 3600000;
 /** Minimum gap between automatic rebuilds, so a flapping relay cannot spin the ladder. */
 const REBUILD_GAP_MS: number = 2000;
+
+/**
+ * What the resolver preferences amount to for one VpnConfig. `summary` is for the
+ * diagnostics log only.
+ */
+interface DnsChoice {
+  /** Handed to VpnConfig.dnsAddresses, in preference order. */
+  addresses: string[];
+  /** Local resolvers, which must stay outside the tunnel to be reachable at all. */
+  excluded: string[];
+  summary: string;
+}
+
+/** Bitmask of the enabled content-blocking categories; 0 means no blocking. */
+function blockingMask(prefs: VpnPrefs): number {
+  let mask: number = 0;
+  if (prefs.blockAds) {
+    mask |= DNS_BLOCK_ADS;
+  }
+  if (prefs.blockTrackers) {
+    mask |= DNS_BLOCK_TRACKERS;
+  }
+  if (prefs.blockMalware) {
+    mask |= DNS_BLOCK_MALWARE;
+  }
+  if (prefs.blockAdult) {
+    mask |= DNS_BLOCK_ADULT;
+  }
+  if (prefs.blockGambling) {
+    mask |= DNS_BLOCK_GAMBLING;
+  }
+  if (prefs.blockSocial) {
+    mask |= DNS_BLOCK_SOCIAL;
+  }
+  return mask;
+}
+
+/**
+ * Resolves the DNS preferences to the addresses the system will hand to applications.
+ *
+ * Custom mode wins whenever it holds at least one valid address; an empty list falls
+ * back to the tunnel resolver, like the daemon's `DnsState::Custom` with no address.
+ * Content blocking is an auto-mode feature: its categories are bits in the resolver
+ * address, so a custom resolver cannot carry them and they are ignored above.
+ */
+function dnsChoice(prefs: VpnPrefs): DnsChoice {
+  if (prefs.dnsMode === 'custom') {
+    const valid: string[] = prefs.customDns.filter((address: string) => isValidDnsAddress(address));
+    if (valid.length > 0) {
+      const excluded: string[] = valid.filter((address: string) => isLocalDnsAddress(address));
+      return {
+        addresses: valid,
+        excluded: excluded,
+        summary: `custom · ${valid.length} resolver(s) · ` +
+          `${excluded.length} reachable outside the tunnel`
+      };
+    }
+    return { addresses: [TUN_DNS], excluded: [], summary: 'custom with no address · default resolver' };
+  }
+  const mask: number = blockingMask(prefs);
+  if (mask === 0) {
+    return { addresses: [TUN_DNS], excluded: [], summary: `auto · no blocking · ${TUN_DNS}` };
+  }
+  const resolver: string = `${DNS_BLOCKING_BASE}${mask}`;
+  return { addresses: [resolver], excluded: [], summary: `auto · blocking mask ${mask} · ${resolver}` };
+}
+
+/**
+ * A route the system must not send into the tunnel. The daemon installs the private
+ * resolvers outside the tunnel (its `DnsConfig::from_addresses(.., non_tunnel_config)`);
+ * here the equivalent is an excluded route for the resolver itself.
+ *
+ * The exclusion is a host route per resolver, not the whole RFC1918 range: the tunnel's
+ * own subnet is inside 10/8 (gateway 10.64.0.1, device address from the account), and
+ * the engine's self-test probes 10.64.0.1, so excluding 10/8 as a whole would take the
+ * tunnel's control traffic and its probe off the tunnel.
+ */
+function excludedResolverRoute(address: string): vpnExtension.RouteInfo {
+  const ipv6: boolean = address.indexOf(':') >= 0;
+  return {
+    interface: 'vpn-tun',
+    destination: {
+      address: { address: address, family: ipv6 ? 2 : 1 },
+      prefixLength: ipv6 ? 128 : 32
+    },
+    gateway: { address: ipv6 ? '::' : '0.0.0.0', family: ipv6 ? 2 : 1 },
+    hasGateway: false,
+    isDefaultRoute: false,
+    // API 20+: the route is installed as a throw route in the VPN table, so the lookup
+    // falls through to the physical network instead of the tunnel.
+    isExcludedRoute: true
+  };
+}
 
 /**
  * One rung of the transport ladder: which family to dial, and whether the datagrams go
@@ -225,6 +333,12 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         ipv4Parts[0] : TUN_GATEWAY;
       const tunPrefix: number = ipv4Parts.length > 1 ? Number.parseInt(ipv4Parts[1], 10) : 32;
       native.logLine(`tun address ${tunAddress}/${tunPrefix} · gateway ${TUN_GATEWAY}`);
+      // DNS is a preference, not part of the intent: read it from the same store the
+      // settings page writes, like protocolMode, so a replayed Want cannot restore an
+      // old choice. The addresses are re-validated here because one malformed entry
+      // makes the system reject the whole VpnConfig.
+      const prefs: VpnPrefs = await VpnSettings.load(this.context);
+      const dns: DnsChoice = dnsChoice(prefs);
       const addresses: vpnExtension.LinkAddress[] = [
         { address: { address: tunAddress, family: 1 }, prefixLength: tunPrefix }
       ];
@@ -268,11 +382,17 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         hilog.info(DOMAIN, TAG, 'ipv6 %{public}s', ipv6Cidr);
       }
 
+      // Private resolvers cannot be reached through the relay, so their traffic has to
+      // leave by the physical network even though the default route claims everything.
+      for (const address of dns.excluded) {
+        routes.push(excludedResolverRoute(address));
+      }
+
       this.connection = vpnExtension.createVpnConnection(this.context);
       const config: vpnExtension.VpnConfig = {
         addresses: addresses,
         routes: routes,
-        dnsAddresses: [TUN_DNS],
+        dnsAddresses: dns.addresses,
         mtu: TUN_MTU,
         isIPv4Accepted: true,
         isIPv6Accepted: ipv6Cidr.length > 0,
@@ -285,10 +405,13 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
 
       this.tunnelFd = await this.connection.create(config);
       hilog.info(DOMAIN, TAG, 'tun fd=%{public}d', this.tunnelFd);
-      native.logLine(`vpn config: tun fd ${this.tunnelFd} · mtu ${TUN_MTU} · dns ${TUN_DNS} · ` +
+      native.logLine(`vpn config: tun fd ${this.tunnelFd} · mtu ${TUN_MTU} · ` +
+        `dns ${dns.addresses.join(', ')} · ` +
         `ipv6 ${ipv6Cidr.length > 0 ? ipv6Cidr : 'off'} · families ${this.ipVersion} · ` +
         `killSwitch ${killSwitch} · ` +
         `own traffic goes through the tunnel (protect() covers the engine socket)`);
+      native.logLine(`dns: ${dns.summary}` +
+        (dns.excluded.length > 0 ? ` · outside the tunnel: ${dns.excluded.join(', ')}` : ''));
       native.logLine(`candidates: ${this.candidates.length} from ${this.target}`);
 
       if (this.candidates.length === 0 && this.relayIp.length > 0 && this.relayKey.length > 0) {
