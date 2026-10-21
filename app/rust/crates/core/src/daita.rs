@@ -816,7 +816,7 @@ mod tests {
                 // The server connection has to be driven until the client has read the
                 // trailers; dropping it immediately resets the stream before the last
                 // frames leave the socket.
-                let _ = tokio::time::timeout(Duration::from_secs(1), connection.accept()).await;
+                let _ = tokio::time::timeout(Duration::from_millis(100), connection.accept()).await;
             });
 
             let stream = TcpStream::connect(address).await.expect("connect");
@@ -827,5 +827,97 @@ mod tests {
             assert_eq!(negotiated.max_padding.to_bits(), 0.125f64.to_bits());
             assert_eq!(negotiated.max_blocking.to_bits(), 0.5f64.to_bits());
         });
+    }
+
+    /// Exercises the exact C entry point the NAPI shim calls: fd duplication, generated
+    /// keypair, JSON shape and the private key handoff the ArkTS restart relies on.
+    #[test]
+    fn negotiate_napi_returns_the_arkts_contract() {
+        use std::ffi::CString;
+        use std::os::unix::io::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking listener");
+        let address = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).expect("async listener");
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut connection = h2::server::handshake(stream).await.expect("server h2");
+                let (request, mut respond) = connection
+                    .accept()
+                    .await
+                    .expect("connection stays open")
+                    .expect("one request");
+                let mut body = request.into_body();
+                while let Some(chunk) = body.data().await {
+                    chunk.expect("request body");
+                }
+
+                let mut daita = Vec::new();
+                let machine = b"02eNpjYEAHjOgCAAA0AAI=";
+                daita.push(0x0a);
+                daita.push(machine.len() as u8);
+                daita.extend_from_slice(machine);
+                daita.push(0x11);
+                daita.extend_from_slice(&0.5f64.to_bits().to_le_bytes());
+                daita.push(0x19);
+                daita.extend_from_slice(&0.25f64.to_bits().to_le_bytes());
+                let mut payload = vec![0x12, daita.len() as u8];
+                payload.extend_from_slice(&daita);
+
+                let response = http::Response::builder()
+                    .status(200)
+                    .header(header::CONTENT_TYPE, "application/grpc")
+                    .body(())
+                    .expect("response");
+                let mut send = respond.send_response(response, false).expect("send response");
+                send.send_data(Bytes::from(encode_grpc_message(&payload)), false)
+                    .expect("send data");
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", "0".parse().expect("status value"));
+                send.send_trailers(trailers).expect("send trailers");
+                let _ = tokio::time::timeout(Duration::from_millis(100), connection.accept()).await;
+            });
+        });
+
+        let stream = std::net::TcpStream::connect(address).expect("connect");
+        let parent = base64::engine::general_purpose::STANDARD.encode([0x33u8; 32]);
+        let parent = CString::new(parent).expect("no nul");
+        let empty = CString::new("").expect("empty");
+        let mut out = vec![0u8; 64 * 1024];
+        let written = mh_negotiate_daita(
+            stream.as_raw_fd(),
+            parent.as_ptr(),
+            empty.as_ptr(),
+            out.as_mut_ptr() as *mut c_char,
+            out.len() as c_int,
+        );
+        assert!(written > 0, "negotiation wrote no JSON");
+        let text = std::str::from_utf8(&out[..written as usize]).expect("utf-8 json");
+        let value: Value = serde_json::from_str(text).expect("json");
+        assert_eq!(value["ok"], Value::Bool(true), "negotiation returned {text}");
+        assert_eq!(value["machines"], serde_json::json!(["02eNpjYEAHjOgCAAA0AAI="]));
+        assert_eq!(value["maxPadding"].as_f64(), Some(0.5));
+        assert_eq!(value["maxBlocking"].as_f64(), Some(0.25));
+        assert_eq!(value["psk"], Value::String(String::new()));
+
+        // The returned private key must be the one whose public half was registered.
+        let private = value["ephemeralKey"].as_str().expect("ephemeral key");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(private)
+            .expect("base64 key");
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&bytes);
+        let public = PublicKey::from(&StaticSecret::from(secret));
+        let expected =
+            base64::engine::general_purpose::STANDARD.encode(public.as_bytes());
+        assert_eq!(value["ephemeralPublicKey"], Value::String(expected));
+
+        server.join().expect("server thread");
     }
 }
