@@ -1,13 +1,15 @@
 //! How WireGuard datagrams reach a relay.
 //!
 //! One module per transport, each implementing [`Transport`]: `direct` is plain UDP to the
-//! relay, `shadowsocks` wraps every datagram for a bridge relay. LWO, udp2tcp and QUIC land
+//! relay, `shadowsocks` wraps every datagram for a bridge relay, `quic` carries them as
+//! MASQUE CONNECT-UDP datagrams through a QUIC proxy on the relay. LWO and udp2tcp land
 //! here as sibling modules and plug into [`TransportFactory`], without touching the engine.
 //!
 //! The socket is created by the extension and `protect()`ed, so it bypasses the tunnel the
 //! engine is building.
 
 mod direct;
+mod quic;
 mod shadowsocks;
 
 use std::future::Future;
@@ -126,7 +128,7 @@ impl TransportFactory {
         relay: SocketAddr,
         bridge: Option<SocketAddr>,
         transport: &str,
-        _settings: &str,
+        settings: &str,
     ) -> Result<Self, String> {
         let transport: Box<dyn Transport> = match transport {
             "" | "direct" => Box::new(direct::Direct::new(socket, relay)),
@@ -134,6 +136,7 @@ impl TransportFactory {
                 Some(bridge) => Box::new(shadowsocks::Shadowsocks::new(socket, relay, bridge)?),
                 None => return Err("shadowsocks without a bridge endpoint".into()),
             },
+            "quic" => Box::new(quic::Quic::new(socket, relay, settings)?),
             other => return Err(format!("unknown transport '{other}'")),
         };
         Ok(Self { transport })

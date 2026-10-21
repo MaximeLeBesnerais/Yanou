@@ -1,0 +1,38 @@
+[package]
+name = "mullvad-masque-proxy"
+version = "0.1.0"
+edition = "2024"
+description = "A limited functionality UDP over HTTP3 proxy"
+repository = "https://github.com/mullvad/mullvadvpn-app/"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Vendored from mullvadvpn-app at e522e99b8c2057e0168e7b9d966ca66ae2103bf5
+# (mullvad-masque-proxy/). Only this manifest was rewritten: the upstream one inherits
+# edition, rust-version, license and every dependency version from the workspace, and its
+# dev-dependencies (talpid-tunnel, clap, criterion) belong to upstream's test benches. The
+# dependency list below is upstream's, with the versions pinned there. Examples, benches
+# and integration tests are not vendored, and the Windows GSO-only dependencies
+# (socket2/windows-sys) are dropped: this copy is only built for OpenHarmony.
+[dependencies]
+anyhow = "1"
+bytes = "1"
+h3 = "0.0.7"
+h3-datagram = "0.0.1"
+h3-quinn = { version = "0.0.9", features = ["datagram"] }
+http = "1"
+log = "0.4"
+quinn = { version = "0.11", default-features = false, features = [
+  "log",
+  "runtime-tokio",
+  "rustls-aws-lc-rs"
+] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+rustls-pki-types = { version = "1", optional = true }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "sync", "time"] }
+typed-builder = "0.21.0"
+
+[features]
+# Upstream's `test` feature, which loads a TLS server config for its integration tests.
+test = ["dep:rustls-pki-types"]

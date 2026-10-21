@@ -53,16 +53,16 @@ const NO_HANDSHAKE_AGE_MS: number = 3600000;
 const REBUILD_GAP_MS: number = 2000;
 
 /**
- * One rung of the transport ladder: which family to dial, and whether the datagrams go
- * through a bridge with Shadowsocks instead of straight to the relay.
+ * One rung of the transport ladder: which family to dial, and how the datagrams reach the
+ * relay.
  */
 interface TransportDescriptor {
   /** Stable name used in diagnostics; one transport may have one entry per family. */
   id: string;
   /** Which transport the native core builds for this attempt. */
-  kind: 'direct' | 'shadowsocks';
+  kind: 'direct' | 'shadowsocks' | 'quic';
   family: 'v4' | 'v6';
-  /** True when the attempt goes through Mullvad's Shadowsocks bridges. */
+  /** True when the attempt hides WireGuard behind an obfuscation transport. */
   obfuscated: boolean;
 }
 
@@ -72,20 +72,29 @@ interface TransportDescriptor {
  * two families through Mullvad's Shadowsocks obfuscation. Every entry is retried with a
  * fresh port and, once the relay list is exhausted, a fresh relay.
  *
- * The protocol preference filters this table. Adding a transport is one entry here plus
- * the code that dials it — never another branch in `startCandidate`.
+ * QUIC comes last: it only exists on relays that publish `features.quic`, and QUIC on
+ * 443 is the narrowest door the relays offer. The protocol preference filters this table.
+ * Adding a transport is one entry here plus the code that dials it — never another branch
+ * in `startCandidate`.
  */
 const TRANSPORTS: TransportDescriptor[] = [
   { id: 'direct-v6', kind: 'direct', family: 'v6', obfuscated: false },
   { id: 'shadowsocks-v4', kind: 'shadowsocks', family: 'v4', obfuscated: true },
   { id: 'direct-v4', kind: 'direct', family: 'v4', obfuscated: false },
-  { id: 'shadowsocks-v6', kind: 'shadowsocks', family: 'v6', obfuscated: true }
+  { id: 'shadowsocks-v6', kind: 'shadowsocks', family: 'v6', obfuscated: true },
+  { id: 'quic-v4', kind: 'quic', family: 'v4', obfuscated: true },
+  { id: 'quic-v6', kind: 'quic', family: 'v6', obfuscated: true }
 ];
 /** Shadowsocks ports published by the relay list (`wireguard.shadowsocks_port_ranges`). */
 const SS_PORT_MIN: number = 51900;
 const SS_PORT_MAX: number = 51949;
 /** Port of the relay's own WireGuard listener, seen from inside the obfuscated tunnel. */
 const SS_INNER_PORT: number = 51820;
+/**
+ * Port of the MASQUE proxy: it pretends to be an ordinary HTTPS server, so it is 443 and
+ * not a WireGuard port.
+ */
+const QUIC_PROXY_PORT: number = 443;
 
 /**
  * The VPN service process.
@@ -338,7 +347,49 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
    * LWO version, a udp2tcp port. Empty when the transport has nothing to say.
    */
   private transportSettings(entry: TransportDescriptor, candidate: RelayCandidate): string {
+    if (entry.kind === 'quic') {
+      const quic: RelayQuic | undefined = candidate.quic;
+      if (quic === undefined || quic === null) {
+        return '';
+      }
+      const addr: string = this.quicAddress(quic, entry.family === 'v6');
+      const domain: string = quic.domain !== undefined && quic.domain !== null ? quic.domain : '';
+      const token: string = quic.token !== undefined && quic.token !== null ? quic.token : '';
+      if (addr.length === 0 || domain.length === 0 || token.length === 0) {
+        return '';
+      }
+      // The native side dials addr:443, uses domain as the TLS SNI (and the HTTP
+      // authority), and puts token in the CONNECT request's Authorization header.
+      const settings: Record<string, string> = {
+        'domain': domain,
+        'token': token,
+        'addr': addr
+      };
+      return JSON.stringify(settings);
+    }
     return '';
+  }
+
+  /**
+   * The QUIC proxy address for one family, or '' when the relay publishes none.
+   *
+   * `features.quic.addr_in` mixes both families, and the relay's own addresses appear
+   * there only when they also serve as proxy addresses, so this list is the only source
+   * for the address to dial. One is picked at random, like the official relay selector
+   * does, so retries spread over the addresses instead of always hitting the first.
+   */
+  private quicAddress(quic: RelayQuic, v6: boolean): string {
+    const addresses: string[] = quic.addr !== undefined && quic.addr !== null ? quic.addr : [];
+    const matching: string[] = [];
+    for (const address of addresses) {
+      if (address.includes(':') === v6) {
+        matching.push(address);
+      }
+    }
+    if (matching.length === 0) {
+      return '';
+    }
+    return matching[Math.floor(Math.random() * matching.length)];
   }
 
   /**
@@ -378,28 +429,54 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       this.candidateIndex += 1;
 
       const wantsV6: boolean = entry.family === 'v6';
-      const obfuscated: boolean = entry.obfuscated;
       const ipv6: string = candidate.ipv6 !== undefined && candidate.ipv6 !== null ?
         candidate.ipv6 : '';
-      if (wantsV6 && ipv6.length === 0) {
+      // A relay without its own IPv6 address has nothing to dial over v6. QUIC is the
+      // exception: it dials a proxy address the relay publishes, not the relay's own.
+      if (wantsV6 && ipv6.length === 0 && entry.kind !== 'quic') {
         continue;
       }
-      const endpointIp: string = wantsV6 ? ipv6 : candidate.ip;
+      // QUIC dials a proxy address the relay publishes, not the relay's own address, and
+      // only has one when it carries `features.quic`. A rung that does not apply to this
+      // relay is skipped, which is what keeps the other transports working unchanged.
+      const quic: RelayQuic | undefined = candidate.quic;
+      let quicAddr: string = '';
+      if (entry.kind === 'quic') {
+        if (quic === undefined || quic === null) {
+          continue;
+        }
+        quicAddr = this.quicAddress(quic, wantsV6);
+        if (quicAddr.length === 0) {
+          continue;
+        }
+      }
+      const endpointIp: string = entry.kind === 'quic' ? quicAddr : (wantsV6 ? ipv6 : candidate.ip);
       const family: number = wantsV6 ? 6 : 4;
-      const port: number = obfuscated ? this.nextShadowsocksPort() : this.nextPort();
+      // QUIC always lands on the proxy's HTTPS port; the other transports pick a WireGuard
+      // or Shadowsocks port from the relay list.
+      const port: number = entry.kind === 'quic' ? QUIC_PROXY_PORT :
+        (entry.kind === 'shadowsocks' ? this.nextShadowsocksPort() : this.nextPort());
       // Shadowsocks goes to a dedicated address when the relay publishes one; the relay's
       // own address is the one that gets blackholed.
       const extra: string[] = candidate.ssExtra !== undefined && candidate.ssExtra !== null ?
         candidate.ssExtra : [];
       const ssHost: string = extra.length > 0 ? extra[Math.floor(Math.random() * extra.length)] :
         endpointIp;
-      const hostPort: string = ssHost.includes(':') ? `[${ssHost}]:${port}` : `${ssHost}:${port}`;
-      const bridge: string = obfuscated ? hostPort : '';
+      const socketHost: string = entry.kind === 'shadowsocks' ? ssHost : endpointIp;
+      const hostPort: string = socketHost.includes(':') ? `[${socketHost}]:${port}` :
+        `${socketHost}:${port}`;
+      const bridge: string = entry.kind === 'shadowsocks' ? hostPort : '';
+      const settings: string = this.transportSettings(entry, candidate);
+      if (entry.kind === 'quic' && settings.length === 0) {
+        // A relay that publishes `features.quic` without a usable token, SNI or address is
+        // a broken entry, not a network problem: skip it instead of spending an attempt.
+        continue;
+      }
 
       this.target = candidate.hostname;
       // Record what this attempt is before dialling, so a payload published mid-attempt
       // never describes the previous candidate.
-      this.transport = obfuscated ? 'shadowsocks' : 'direct';
+      this.transport = entry.kind;
       this.family = wantsV6 ? 'ipv6' : 'ipv4';
       this.endpoint = hostPort;
       this.handshakeMs = 0;
@@ -418,15 +495,20 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         native.logLine(`relay socket not available (${udpFd})`);
       }
 
-      const wireguardPort: number = obfuscated ? SS_INNER_PORT : port;
+      // Shadowsocks reaches the relay's own listener on 51820 from inside the tunnel while
+      // dialling the bridge outside; QUIC names that listener itself, so the endpoint the
+      // engine is told about is the proxy one it actually talks to.
+      const wireguardPort: number = entry.kind === 'shadowsocks' ? SS_INNER_PORT :
+        (entry.kind === 'quic' ? QUIC_PROXY_PORT : port);
       const started = JSON.parse(native.tunnelStart(this.tunnelFd, TUN_MTU, candidate.publicKey,
-        endpointIp, wireguardPort, bridge, entry.kind, this.transportSettings(entry, candidate))) as
+        endpointIp, wireguardPort, bridge, entry.kind, settings)) as
         Record<string, Object>;
       hilog.info(DOMAIN, TAG, 'attempt %{public}s %{public}s', candidate.hostname,
         JSON.stringify(started));
+      const route: string = entry.kind === 'shadowsocks' ? `shadowsocks via ${ssHost}` :
+        (entry.kind === 'quic' ? `quic via ${quicAddr}` : 'direct');
       native.logLine(`attempt ${this.candidateIndex}: ${candidate.hostname} ` +
-        `${endpointIp}:${port} ipv${family} ` +
-        `${obfuscated ? `shadowsocks via ${ssHost}` : 'direct'}`);
+        `${endpointIp}:${port} ipv${family} ${route}`);
       if (started['ok'] === true) {
         return;
       }

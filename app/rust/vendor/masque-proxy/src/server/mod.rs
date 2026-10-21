@@ -1,0 +1,556 @@
+use std::{
+    collections::HashSet,
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    str::FromStr,
+    sync::Arc,
+};
+
+use anyhow::{Context, anyhow};
+use bytes::Bytes;
+use h3::{
+    quic::{BidiStream, StreamId},
+    server::{self, Connection, RequestStream},
+};
+use h3_datagram::{datagram::Datagram, datagram_traits::HandleDatagramsExt};
+use http::{StatusCode, Uri, header};
+use quinn::{Endpoint, Incoming, crypto::rustls::QuicServerConfig};
+use tokio::{net::UdpSocket, sync::mpsc};
+use typed_builder::TypedBuilder;
+
+use crate::{
+    DatagramFragmentor, MASQUE_WELL_KNOWN_PATH, MAX_INFLIGHT_PACKETS, MIN_IPV4_MTU, MIN_IPV6_MTU,
+    ProxyTaskError, Stopped, TaskError, TaskResult, Tasks, compute_udp_payload_size,
+    fragment::{DefragReceived, Fragments},
+    outgrew_path_mtu,
+    stats::Stats,
+};
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("Bad TLS config")]
+    BadTlsConfig(#[source] quinn::crypto::rustls::NoInitialCipherSuite),
+    #[error("Failed to bind server socket")]
+    BindSocket(#[source] io::Error),
+    #[error("Failed to send negotiation response")]
+    SendNegotiationResponse(#[source] h3::Error),
+    #[error("Invalid MTU: must be at least {min_mtu}")]
+    InvalidMtu { min_mtu: u16 },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+pub struct Server {
+    endpoint: Endpoint,
+    params: Arc<ServerParams>,
+    stats: Arc<Stats>,
+}
+
+#[derive(TypedBuilder)]
+pub struct ServerParams {
+    /// Allowed target IPs for the proxy connection
+    pub allowed_hosts: AllowedIps,
+
+    /// Server hostname expected from clients
+    #[builder(default)]
+    pub hostname: Option<String>,
+
+    /// Maximum transfer unit
+    #[builder(default = 1500)]
+    pub mtu: u16,
+
+    /// Authorization header expected from clients
+    #[builder(default)]
+    pub auth_header: Option<String>,
+}
+
+#[derive(Default, Clone)]
+pub struct AllowedIps {
+    hosts: Arc<HashSet<IpAddr>>,
+}
+
+impl<T: IntoIterator<Item = IpAddr>> From<T> for AllowedIps {
+    fn from(value: T) -> Self {
+        AllowedIps {
+            hosts: Arc::new(value.into_iter().collect()),
+        }
+    }
+}
+
+impl AllowedIps {
+    fn ip_allowed(&self, ip: IpAddr) -> bool {
+        self.hosts.is_empty() || self.hosts.contains(&ip)
+    }
+}
+
+impl Server {
+    pub fn bind(
+        bind_addr: SocketAddr,
+        tls_config: Arc<rustls::ServerConfig>,
+        params: ServerParams,
+    ) -> Result<Self> {
+        Self::validate_mtu(params.mtu, bind_addr)?;
+
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(tls_config).map_err(Error::BadTlsConfig)?,
+        ));
+
+        let endpoint = Endpoint::server(server_config, bind_addr).map_err(Error::BindSocket)?;
+
+        Ok(Self {
+            endpoint,
+            params: Arc::new(params),
+            stats: Arc::default(),
+        })
+    }
+
+    const fn validate_mtu(mtu: u16, bind_addr: SocketAddr) -> Result<()> {
+        let min_mtu = if bind_addr.is_ipv4() {
+            MIN_IPV4_MTU
+        } else {
+            MIN_IPV6_MTU
+        };
+        if mtu >= min_mtu {
+            Ok(())
+        } else {
+            Err(Error::InvalidMtu { min_mtu })
+        }
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
+    pub async fn run(self) -> Result<()> {
+        while let Some(new_connection) = self.endpoint.accept().await {
+            tokio::spawn(Self::handle_incoming_connection(
+                new_connection,
+                Arc::clone(&self.params),
+                Arc::clone(&self.stats),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn handle_incoming_connection(
+        connection: Incoming,
+        server_params: Arc<ServerParams>,
+        stats: Arc<Stats>,
+    ) {
+        let conn = match connection.await {
+            Ok(conn) => conn,
+            Err(err) => {
+                log::error!("accepting connection failed: {:?}", err);
+                return;
+            }
+        };
+
+        log::debug!("new connection established");
+
+        let quinn_conn = conn.clone();
+
+        let Ok(connection) = server::builder()
+            .enable_datagram(true)
+            .build(h3_quinn::Connection::new(conn))
+            .await
+        else {
+            log::error!("Failed to construct a new H3 server connection");
+            return;
+        };
+
+        Self::accept_proxy_request(quinn_conn, connection, server_params, stats).await;
+    }
+
+    /// Accept an HTTP request and try to handle it as a proxy request.
+    async fn accept_proxy_request(
+        quic_conn: quinn::Connection,
+        mut http_conn: Connection<h3_quinn::Connection, Bytes>,
+        server_params: Arc<ServerParams>,
+        stats: Arc<Stats>,
+    ) {
+        let (http_request, mut stream) = match http_conn.accept().await {
+            Ok(Some((req, stream))) => (req, stream),
+
+            // indicating no more streams to be received
+            Ok(None) => return,
+
+            Err(err) => {
+                log::error!("error on accept {}", err);
+                return;
+            }
+        };
+
+        let proxy_uri = match ProxyUri::try_from(http_request.uri()) {
+            Ok(proxy_uri) => proxy_uri,
+            Err(e) => {
+                log::debug!("Bad proxy URI: {e}");
+                return;
+            }
+        };
+
+        if let Some(required_auth) = &server_params.auth_header {
+            match http_request.headers().get(header::AUTHORIZATION) {
+                Some(actual_auth) if actual_auth == required_auth => (),
+                _ => return handle_invalid_auth(stream).await,
+            }
+        }
+
+        if let Some(hostname) = &server_params.hostname
+            && &proxy_uri.hostname != hostname
+        {
+            let valid_uri = ProxyUri {
+                hostname: hostname.clone(),
+                ..proxy_uri
+            };
+
+            respond_with_redirect(stream, valid_uri).await;
+
+            // NOTE: Recursing like this makes us vulnerable to DoS if the client keeps
+            // sending the wrong hostname. This is fine since this is just an example server.
+            Box::pin(Self::accept_proxy_request(
+                quic_conn,
+                http_conn,
+                server_params,
+                stats,
+            ))
+            .await;
+
+            return;
+        }
+
+        if !server_params
+            .allowed_hosts
+            .ip_allowed(proxy_uri.target_addr.ip())
+        {
+            return handle_disallowed_ip(stream).await;
+        }
+
+        let bind_addr = SocketAddr::new(unspecified_addr(proxy_uri.target_addr.ip()), 0);
+        let Ok(udp_socket) = UdpSocket::bind(bind_addr).await else {
+            return handle_failed_socket(stream).await;
+        };
+        if let Err(err) = udp_socket.connect(proxy_uri.target_addr).await {
+            log::error!("Failed to set destination for UDP socket: {err}");
+            return handle_failed_socket(stream).await;
+        };
+
+        if handle_established_connection(&mut stream).await.is_err() {
+            return;
+        }
+
+        let stream_id = stream.id();
+        let udp_socket = Arc::new(udp_socket);
+        let (client_tx, client_rx) = mpsc::channel(MAX_INFLIGHT_PACKETS);
+        let (send_tx, send_rx) = mpsc::channel(MAX_INFLIGHT_PACKETS);
+
+        let mut tasks = Tasks::default();
+        tasks.spawn_task(connection_task(
+            stream_id,
+            quic_conn.clone(),
+            http_conn,
+            send_rx,
+            client_tx,
+        ));
+
+        let max_udp_payload_size =
+            compute_udp_payload_size(server_params.mtu, proxy_uri.target_addr);
+        tasks.spawn_task(proxy_rx_task(
+            proxy_uri.target_addr,
+            Arc::clone(&udp_socket),
+            send_tx,
+            DatagramFragmentor::new(quic_conn, stream_id, max_udp_payload_size, stats.clone()),
+        ));
+        tasks.spawn_task(proxy_tx_task(udp_socket, client_rx, stats));
+
+        if let Err(err) = tasks.join_and_abort().await {
+            match err {
+                TaskError::Task(err) => log::error!("Server task error: {err}"),
+                TaskError::Panicked(err) => log::error!("Server task panicked: {err}"),
+            }
+        }
+
+        // TODO: stream.finish()?
+    }
+}
+
+/// Forward packets from `send_rx` to `connection`, and from `connection` to `client_tx`.
+async fn connection_task(
+    stream_id: StreamId,
+    quinn_conn: quinn::Connection,
+    mut connection: Connection<h3_quinn::Connection, Bytes>,
+    mut outgoing_datagram_rx: mpsc::Receiver<Bytes>,
+    incoming_datagram_tx: mpsc::Sender<Datagram>,
+) -> TaskResult {
+    loop {
+        tokio::select! {
+            incoming_packet = connection.read_datagram() => match incoming_packet {
+                Ok(Some(received_packet)) => {
+                    if received_packet.stream_id() != stream_id {
+                        return Err(ProxyTaskError::UnexpectedStreamId);
+                    }
+
+                    if incoming_datagram_tx.send(received_packet).await.is_err() {
+                        break; // receiver is gone
+                    }
+                }
+                Ok(None) => break, // EOF
+                Err(err) => {
+                    return Err(ProxyTaskError::ReadDatagram(err));
+                }
+            },
+            outgoing_packet = outgoing_datagram_rx.recv() => {
+                let Some(outgoing_packet) = outgoing_packet else {
+                    break; // sender is gone
+                };
+
+                let datagram_len = outgoing_packet.len();
+                if let Err(err) = connection.send_datagram(stream_id, outgoing_packet) {
+                    if !outgrew_path_mtu(&quinn_conn, stream_id, datagram_len) {
+                        return Err(ProxyTaskError::SendDatagram(err));
+                    }
+                    log::trace!("Dropping a datagram that no longer fits in the path MTU");
+                }
+            }
+        }
+    }
+
+    Ok(Stopped)
+}
+
+/// Reassemble and forward packet fragments from `client_rx` to `udp_socket`.
+async fn proxy_tx_task(
+    udp_socket: impl AsRef<UdpSocket>,
+    mut client_rx: mpsc::Receiver<Datagram>,
+    stats: Arc<Stats>,
+) -> TaskResult {
+    let udp_socket = udp_socket.as_ref();
+    let mut fragments = Fragments::default();
+    loop {
+        let Some(quic_datagram) = client_rx.recv().await else {
+            break;
+        };
+
+        let quic_payload = quic_datagram.into_payload();
+        let packet_len = quic_payload.len();
+
+        let packet = match fragments.handle_incoming_packet(quic_payload) {
+            Ok(DefragReceived::Nonfragmented(packet)) => {
+                stats.rx(packet_len, false);
+                packet
+            }
+            Ok(DefragReceived::Reassembled(packet)) => {
+                stats.rx(packet_len, true);
+                packet.freeze()
+            }
+            Ok(DefragReceived::Fragment) => {
+                stats.rx(packet_len, true);
+                continue;
+            }
+            Err(err) => {
+                log::trace!("Failed to reassemble incoming packet: {err}");
+                continue;
+            }
+        };
+
+        udp_socket
+            .send(&packet)
+            .await
+            .map_err(ProxyTaskError::UdpWrite)?;
+    }
+    Ok(Stopped)
+}
+
+/// Forward packets from `udp_socket` to `send_tx`, and fragment them if they exceed
+/// `maximum_packet_size`.
+async fn proxy_rx_task(
+    target_addr: SocketAddr,
+    udp_socket: impl AsRef<UdpSocket>,
+    send_tx: mpsc::Sender<Bytes>,
+    mut fragmentor: DatagramFragmentor,
+) -> TaskResult {
+    let udp_socket = udp_socket.as_ref();
+
+    loop {
+        let read_buf = fragmentor.get_read_buf();
+        let (_n, sender_addr) = udp_socket
+            .recv_buf_from(read_buf)
+            .await
+            .map_err(ProxyTaskError::UdpRead)?;
+
+        if sender_addr != target_addr {
+            fragmentor.discard();
+            continue;
+        }
+
+        let packets = fragmentor
+            .fragment()
+            .map_err(ProxyTaskError::PacketTooLarge)?;
+        for packet in packets {
+            if send_tx.send(packet).await.is_err() {
+                return Ok(Stopped);
+            }
+        }
+    }
+}
+
+async fn handle_established_connection<T: BidiStream<Bytes>>(
+    stream: &mut RequestStream<T, Bytes>,
+) -> Result<()> {
+    let response = http::Response::builder()
+        .status(StatusCode::OK)
+        .body(())
+        .unwrap();
+    stream
+        .send_response(response)
+        .await
+        .map_err(Error::SendNegotiationResponse)?;
+    Ok(())
+}
+
+async fn handle_invalid_auth<T: BidiStream<Bytes>>(mut stream: RequestStream<T, Bytes>) {
+    let response = http::Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .body(())
+        .unwrap();
+    let _ = stream.send_response(response).await;
+}
+
+async fn handle_disallowed_ip<T: BidiStream<Bytes>>(mut stream: RequestStream<T, Bytes>) {
+    let response = http::Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .body(())
+        .unwrap();
+    let _ = stream.send_response(response).await;
+}
+
+async fn handle_failed_socket<T: BidiStream<Bytes>>(mut stream: RequestStream<T, Bytes>) {
+    let response = http::Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(())
+        .unwrap();
+    let _ = stream.send_response(response).await;
+}
+
+async fn respond_with_redirect<T: BidiStream<Bytes>>(
+    mut stream: RequestStream<T, Bytes>,
+    valid_uri: ProxyUri,
+) {
+    let uri = Uri::from(valid_uri).to_string();
+    let response = http::Response::builder()
+        .status(StatusCode::PERMANENT_REDIRECT)
+        .header("Location", uri)
+        .body(())
+        .unwrap();
+    let _ = stream.send_response(response).await;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProxyUri {
+    hostname: String,
+    target_addr: SocketAddr,
+}
+
+impl From<ProxyUri> for Uri {
+    fn from(proxy_uri: ProxyUri) -> Self {
+        Uri::builder()
+            .scheme("https")
+            .authority(proxy_uri.hostname)
+            .path_and_query(format!(
+                "{MASQUE_WELL_KNOWN_PATH}/{ip}/{port}",
+                ip = proxy_uri.target_addr.ip(),
+                port = proxy_uri.target_addr.port(),
+            ))
+            .build()
+            .unwrap()
+    }
+}
+
+impl TryFrom<&Uri> for ProxyUri {
+    type Error = anyhow::Error;
+
+    fn try_from(uri: &Uri) -> std::result::Result<Self, Self::Error> {
+        let host = uri.host().context("Expected a URI containing a host")?;
+
+        let path = uri.path();
+        let anyhow_path_err =
+            || anyhow!("Expected `/.well-known/masque/udp/<ip>/<port>`, found `{path}`");
+        let (addr_str, port_str) = path
+            .strip_prefix(MASQUE_WELL_KNOWN_PATH)
+            .with_context(anyhow_path_err)?
+            .trim_start_matches('/')
+            .split_once('/')
+            .with_context(anyhow_path_err)?;
+
+        let port_str = port_str.trim_end_matches('/');
+
+        Ok(ProxyUri {
+            hostname: host.to_string(),
+            target_addr: SocketAddr::new(
+                addr_str.parse().with_context(anyhow_path_err)?,
+                port_str.parse().with_context(anyhow_path_err)?,
+            ),
+        })
+    }
+}
+
+impl FromStr for ProxyUri {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        ProxyUri::try_from(&Uri::from_str(s)?)
+    }
+}
+
+fn unspecified_addr(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+    }
+}
+
+#[cfg(feature = "test")]
+pub fn server_tls_config() -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+
+    let key = PrivateKeyDer::from_pem_file("tests/test.key")?;
+    let cert_chain = CertificateDer::from_pem_file("tests/test.crt")?;
+
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_no_client_auth()
+    .with_single_cert(vec![cert_chain], key)?;
+
+    tls_config.max_early_data_size = u32::MAX;
+    tls_config.alpn_protocols = vec![b"h3".into()];
+
+    Ok(Arc::new(tls_config))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_get_good_slashy_ocketaddr() {
+        let addr: IpAddr = "192.168.1.1".parse().unwrap();
+        let port: u16 = 7979;
+        let expected = ProxyUri {
+            hostname: "foo".to_string(),
+            target_addr: SocketAddr::new(addr, port),
+        };
+        let good_path = format!("https://foo{MASQUE_WELL_KNOWN_PATH}///{addr}/{port}////");
+
+        assert_eq!(ProxyUri::from_str(&good_path).unwrap(), expected)
+    }
+
+    #[test]
+    fn test_get_bad_socketaddr() {
+        let addr: IpAddr = "192.168.1.1".parse().unwrap();
+        let port: u16 = 7979;
+        let bad_path = format!("{MASQUE_WELL_KNOWN_PATH}{addr}adsfasd/asdfasdf/{port}");
+
+        assert!(ProxyUri::from_str(&bad_path).is_err())
+    }
+}
