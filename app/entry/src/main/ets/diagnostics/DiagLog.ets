@@ -29,6 +29,10 @@ export interface DiagEntry {
   /** Elapsed seconds reported by the last log line, if any. */
   duration: string;
   attempts: number;
+  /** True when the attempt ran an entry and an exit relay. */
+  multihop: boolean;
+  /** Exit relay hostname for a multihop attempt, or empty. */
+  exitHost: string;
   body: string;
   lineCount: number;
 }
@@ -96,6 +100,8 @@ function buildEntry(id: string, title: string, startedAt: string, lines: string[
   let summary: string = '';
   let duration: string = '';
   let attempts: number = 0;
+  let multihop: boolean = false;
+  let exitHost: string = '';
 
   for (const line of lines) {
     if (line.trim().length === 0) {
@@ -105,6 +111,14 @@ function buildEntry(id: string, title: string, startedAt: string, lines: string[
     const message: string = messageOf(line);
     if (message.startsWith('attempt ')) {
       attempts += 1;
+    }
+    if (message.startsWith('multihop: exit ')) {
+      multihop = true;
+      const after: string = message.substring('multihop: exit '.length).trim();
+      const space: number = after.indexOf(' ');
+      exitHost = space > 0 ? after.substring(0, space) : after;
+    } else if (message.includes('multihop on') || message.includes('multihop handshake')) {
+      multihop = true;
     }
     const elapsed: string = elapsedOf(line);
     if (elapsed.length > 0) {
@@ -152,6 +166,8 @@ function buildEntry(id: string, title: string, startedAt: string, lines: string[
     summary: summary,
     duration: duration,
     attempts: attempts,
+    multihop: multihop,
+    exitHost: exitHost,
     body: body.join('\n'),
     lineCount: body.length
   };

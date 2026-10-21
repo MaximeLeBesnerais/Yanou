@@ -33,6 +33,8 @@ const APP_VERSION: string = '0.1.0';
 interface DiagManifestFile {
   name: string;
   target: string;
+  exit: string;
+  multihop: boolean;
   startedAt: string;
   status: string;
   lines: number;
@@ -630,6 +632,34 @@ struct Index {
       mask |= 32;
     }
     return mask === 0 ? '10.64.0.1' : `100.64.0.${mask}`;
+  }
+
+  /** One-line state for the DNS row on the settings screen. */
+  private dnsSummary(): string {
+    if (this.prefs.dnsMode === 'custom' && this.prefs.customDns.length > 0) {
+      const count: number = this.prefs.customDns.length;
+      return `Custom · ${count} resolver${count > 1 ? 's' : ''}`;
+    }
+    const labels: string[] = [];
+    if (this.prefs.blockAds) {
+      labels.push('ads');
+    }
+    if (this.prefs.blockTrackers) {
+      labels.push('trackers');
+    }
+    if (this.prefs.blockMalware) {
+      labels.push('malware');
+    }
+    if (this.prefs.blockAdult) {
+      labels.push('adult content');
+    }
+    if (this.prefs.blockGambling) {
+      labels.push('gambling');
+    }
+    if (this.prefs.blockSocial) {
+      labels.push('social media');
+    }
+    return labels.length === 0 ? 'Automatic · no blocking' : `Automatic · blocking ${labels.join(', ')}`;
   }
 
   private effectiveMtu(): number {
@@ -3375,8 +3405,10 @@ struct Index {
     const safe: string = entry.target.replace(/[^A-Za-z0-9._-]+/g, '-')
       .replace(/^-+/, '').replace(/-+$/, '');
     const host: string = safe.length > 0 ? safe : 'unknown';
+    const exit: string = entry.exitHost.length > 0 ?
+      `-via-${entry.exitHost.replace(/[^A-Za-z0-9._-]+/g, '-')}` : '';
     const number: string = index < 10 ? `00${index}` : (index < 100 ? `0${index}` : `${index}`);
-    return `${number}-${host}-${this.entryStamp(entry)}.txt`;
+    return `${number}-${host}${exit}-${this.entryStamp(entry)}.txt`;
   }
 
   /** Header block every exported entry starts with. */
@@ -3394,6 +3426,7 @@ struct Index {
       `summary    ${entry.summary}`,
       `duration   ${duration}`,
       `attempts   ${entry.attempts}`,
+      `multihop   ${entry.multihop ? (entry.exitHost.length > 0 ? `exit ${entry.exitHost}` : 'on') : 'off'}`,
       `lines      ${entry.lineCount}`,
       '---',
       ''
@@ -3480,6 +3513,8 @@ struct Index {
         files.push({
           name: name,
           target: entry.target,
+          exit: entry.exitHost,
+          multihop: entry.multihop,
           startedAt: entry.startedAt,
           status: entry.status,
           lines: entry.lineCount
@@ -4405,6 +4440,147 @@ struct Index {
   }
 
   @Builder
+  dnsScreen() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Column({ space: 8 }) {
+        Column({ space: 8 }) {
+          Text('DNS')
+            .fontSize(15)
+            .fontColor($r('sys.color.font_primary'))
+
+          Row({ space: 4 }) {
+            ForEach(this.setDnsModes(), (mode: DnsMode) => {
+              Button(this.setDnsName(mode))
+                .type(ButtonType.Normal)
+                .layoutWeight(1)
+                .height(34)
+                .borderRadius(8)
+                .fontSize(11)
+                .padding({ left: 0, right: 0 })
+                .backgroundColor(this.prefs.dnsMode === mode ?
+                  $r('sys.color.brand') : Color.Transparent)
+                .fontColor(this.prefs.dnsMode === mode ?
+                  Color.White : $r('sys.color.font_secondary'))
+                .onClick(() => {
+                  this.setDnsMode(mode);
+                })
+            }, (mode: DnsMode) => mode)
+          }
+          .width('100%')
+          .padding(3)
+          .borderRadius(10)
+          .backgroundColor($r('sys.color.comp_background_secondary'))
+
+          Text(this.setDnsHint())
+            .fontSize(12)
+            .fontColor($r('sys.color.font_secondary'))
+            .width('100%')
+
+          if (this.prefs.dnsMode === 'custom') {
+            ForEach(this.prefs.customDns, (address: string) => {
+              Row() {
+                Text(address)
+                  .fontSize(15)
+                  .fontColor($r('sys.color.font_primary'))
+                  .layoutWeight(1)
+                Button('Remove')
+                  .type(ButtonType.Capsule)
+                  .height(28)
+                  .fontSize(12)
+                  .padding({ left: 12, right: 12 })
+                  .backgroundColor($r('sys.color.comp_background_secondary'))
+                  .fontColor($r('sys.color.alert'))
+                  .onClick(() => {
+                    this.setRemoveDns(address);
+                  })
+              }
+              .width('100%')
+              .height(40)
+            }, (address: string) => address)
+
+            Row({ space: 8 }) {
+              TextInput({ placeholder: 'IPv4 or IPv6 address', text: this.dnsInput })
+                .layoutWeight(1)
+                .height(38)
+                .fontSize(14)
+                .backgroundColor($r('sys.color.comp_background_secondary'))
+                .borderRadius(8)
+                .placeholderColor($r('sys.color.font_tertiary'))
+                .caretColor($r('sys.color.brand'))
+                .onChange((value: string) => {
+                  this.dnsInput = value;
+                  this.dnsError = '';
+                })
+              Button('Add')
+                .type(ButtonType.Capsule)
+                .height(38)
+                .fontSize(14)
+                .padding({ left: 18, right: 18 })
+                .backgroundColor($r('sys.color.brand'))
+                .fontColor(Color.White)
+                .onClick(() => {
+                  this.setAddDns();
+                })
+            }
+            .width('100%')
+
+            if (this.dnsError.length > 0) {
+              Text(this.dnsError)
+                .fontSize(12)
+                .fontColor($r('sys.color.alert'))
+                .width('100%')
+            }
+          }
+        }
+        .width('100%')
+        .padding({ top: 12, bottom: 12 })
+        .alignItems(HorizontalAlign.Start)
+
+        Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+
+        Column({ space: 4 }) {
+          Text('Content blocking')
+            .fontSize(15)
+            .fontColor($r('sys.color.font_primary'))
+          Text(this.setBlockHint())
+            .fontSize(12)
+            .fontColor($r('sys.color.font_secondary'))
+            .width('100%')
+            .margin({ bottom: 4 })
+
+          this.blockRow('Ads', 'blockAds')
+          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+          this.blockRow('Trackers', 'blockTrackers')
+          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+          this.blockRow('Malware', 'blockMalware')
+          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+          this.blockRow('Adult content', 'blockAdult')
+          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+          this.blockRow('Gambling', 'blockGambling')
+          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+          this.blockRow('Social media', 'blockSocial')
+        }
+        .width('100%')
+        .padding({ top: 12, bottom: 6 })
+        .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+        .borderRadius(CARD_RADIUS)
+        .backgroundColor($r('sys.color.comp_background_primary'))
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width('calc(100% - 32vp)')
+      .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12 })
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
+  }
+
+  @Builder
   settingsScreen() {
     Scroll() {
       Column() {
@@ -4502,126 +4678,27 @@ struct Index {
 
             Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
 
-            Column({ space: 8 }) {
-              Text('DNS')
-                .fontSize(15)
-                .fontColor($r('sys.color.font_primary'))
-
-              Row({ space: 4 }) {
-                ForEach(this.setDnsModes(), (mode: DnsMode) => {
-                  Button(this.setDnsName(mode))
-                    .type(ButtonType.Normal)
-                    .layoutWeight(1)
-                    .height(34)
-                    .borderRadius(8)
-                    .fontSize(11)
-                    .padding({ left: 0, right: 0 })
-                    .backgroundColor(this.prefs.dnsMode === mode ?
-                      $r('sys.color.brand') : Color.Transparent)
-                    .fontColor(this.prefs.dnsMode === mode ?
-                      Color.White : $r('sys.color.font_secondary'))
-                    .onClick(() => {
-                      this.setDnsMode(mode);
-                    })
-                }, (mode: DnsMode) => mode)
+            Row() {
+              Column({ space: 2 }) {
+                Text('DNS')
+                  .fontSize(15)
+                  .fontColor($r('sys.color.font_primary'))
+                Text(this.dnsSummary())
+                  .fontSize(12)
+                  .fontColor($r('sys.color.font_secondary'))
               }
-              .width('100%')
-              .padding(3)
-              .borderRadius(10)
-              .backgroundColor($r('sys.color.comp_background_secondary'))
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
 
-              Text(this.setDnsHint())
-                .fontSize(12)
-                .fontColor($r('sys.color.font_secondary'))
-                .width('100%')
-
-              if (this.prefs.dnsMode === 'custom') {
-                ForEach(this.prefs.customDns, (address: string) => {
-                  Row() {
-                    Text(address)
-                      .fontSize(15)
-                      .fontColor($r('sys.color.font_primary'))
-                      .layoutWeight(1)
-                    Button('Remove')
-                      .type(ButtonType.Capsule)
-                      .height(28)
-                      .fontSize(12)
-                      .padding({ left: 12, right: 12 })
-                      .backgroundColor($r('sys.color.comp_background_secondary'))
-                      .fontColor($r('sys.color.alert'))
-                      .onClick(() => {
-                        this.setRemoveDns(address);
-                      })
-                  }
-                  .width('100%')
-                  .height(40)
-                }, (address: string) => address)
-
-                Row({ space: 8 }) {
-                  TextInput({ placeholder: 'IPv4 or IPv6 address', text: this.dnsInput })
-                    .layoutWeight(1)
-                    .height(38)
-                    .fontSize(14)
-                    .backgroundColor($r('sys.color.comp_background_secondary'))
-                    .borderRadius(8)
-                    .placeholderColor($r('sys.color.font_tertiary'))
-                    .caretColor($r('sys.color.brand'))
-                    .onChange((value: string) => {
-                      this.dnsInput = value;
-                      this.dnsError = '';
-                    })
-                  Button('Add')
-                    .type(ButtonType.Capsule)
-                    .height(38)
-                    .fontSize(14)
-                    .padding({ left: 18, right: 18 })
-                    .backgroundColor($r('sys.color.brand'))
-                    .fontColor(Color.White)
-                    .onClick(() => {
-                      this.setAddDns();
-                    })
-                }
-                .width('100%')
-
-                if (this.dnsError.length > 0) {
-                  Text(this.dnsError)
-                    .fontSize(12)
-                    .fontColor($r('sys.color.alert'))
-                    .width('100%')
-                }
-              }
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(16)
+                .fontColor([$r('sys.color.font_tertiary')])
             }
             .width('100%')
-            .padding({ top: 12, bottom: 12 })
-            .alignItems(HorizontalAlign.Start)
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Column({ space: 4 }) {
-              Text('Content blocking')
-                .fontSize(15)
-                .fontColor($r('sys.color.font_primary'))
-              Text(this.setBlockHint())
-                .fontSize(12)
-                .fontColor($r('sys.color.font_secondary'))
-                .width('100%')
-                .margin({ bottom: 4 })
-
-              this.blockRow('Ads', 'blockAds')
-              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-              this.blockRow('Trackers', 'blockTrackers')
-              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-              this.blockRow('Malware', 'blockMalware')
-              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-              this.blockRow('Adult content', 'blockAdult')
-              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-              this.blockRow('Gambling', 'blockGambling')
-              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-              this.blockRow('Social media', 'blockSocial')
-            }
-            .width('100%')
-            .padding({ top: 12, bottom: 6 })
-            .alignItems(HorizontalAlign.Start)
+            .height(60)
+            .onClick(() => {
+              this.pageStack.pushPath({ name: 'dns' });
+            })
 
             Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
 
@@ -4896,6 +4973,8 @@ struct Index {
             this.accountScreen()
           } else if (name === 'settings') {
             this.settingsScreen()
+          } else if (name === 'dns') {
+            this.dnsScreen()
           } else if (name === 'about') {
             this.aboutScreen()
           }
@@ -4913,7 +4992,8 @@ struct Index {
       (name === 'servers' ? (this.serverMode === 'exit' ? 'Exit relay' : 'Servers') :
         (name === 'logs' ? 'Diagnostics' :
           (name === 'entry' ? 'Connection' :
-            (name === 'account' ? 'Account' : (name === 'about' ? 'About' : 'VPN settings'))))))
+            (name === 'account' ? 'Account' :
+              (name === 'about' ? 'About' : (name === 'dns' ? 'DNS' : 'VPN settings')))))))
     .backgroundColor($r('sys.color.background_secondary'))
   }
 
