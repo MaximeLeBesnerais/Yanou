@@ -1,13 +1,15 @@
 //! How WireGuard datagrams reach a relay.
 //!
 //! One module per transport, each implementing [`Transport`]: `direct` is plain UDP to the
-//! relay, `shadowsocks` wraps every datagram for a bridge relay. LWO, udp2tcp and QUIC land
-//! here as sibling modules and plug into [`TransportFactory`], without touching the engine.
+//! relay, `shadowsocks` wraps every datagram for a bridge relay, and `lwo` obfuscates the
+//! WireGuard header for a relay that advertises LWO. udp2tcp and QUIC land here as sibling
+//! modules and plug into [`TransportFactory`], without touching the engine.
 //!
 //! The socket is created by the extension and `protect()`ed, so it bypasses the tunnel the
 //! engine is building.
 
 mod direct;
+mod lwo;
 mod shadowsocks;
 
 use std::future::Future;
@@ -17,6 +19,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use gotatun::noise::TimerParams;
 use gotatun::packet::{Packet, PacketBufPool};
 use gotatun::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use tokio::net::UdpSocket;
@@ -66,6 +69,16 @@ pub trait Transport: Send + Sync + 'static {
     /// Transport name, for logs and the connection details a later unit adds.
     #[allow(dead_code)]
     fn name(&self) -> &'static str;
+
+    /// WireGuard timer parameters the engine must apply to the peer, if any.
+    ///
+    /// LWO v2 runs the WireGuard timers tuned to the relay's obfuscation; gotatun only
+    /// exposes that as `Peer::dangerously_with_timer_params`, and a transport has no peer
+    /// handle, so the engine asks here before building the device. `None` means the
+    /// WireGuard defaults.
+    fn timer_params(&self) -> Option<TimerParams> {
+        None
+    }
 }
 
 static UDP_SENT: AtomicU64 = AtomicU64::new(0);
@@ -120,13 +133,16 @@ pub struct TransportFactory {
 
 impl TransportFactory {
     /// `transport` names the transport to build; `bridge` is the Shadowsocks endpoint it
-    /// needs. Adding a transport is one arm here and one module, never a new selector.
+    /// needs, `settings` the per-transport JSON the extension produced, and `peer_key` the
+    /// relay's WireGuard public key (LWO derives its obfuscation keys from it). Adding a
+    /// transport is one arm here and one module, never a new selector.
     pub fn new(
         socket: UdpSocket,
         relay: SocketAddr,
         bridge: Option<SocketAddr>,
         transport: &str,
-        _settings: &str,
+        settings: &str,
+        peer_key: Option<[u8; 32]>,
     ) -> Result<Self, String> {
         let transport: Box<dyn Transport> = match transport {
             "" | "direct" => Box::new(direct::Direct::new(socket, relay)),
@@ -134,9 +150,15 @@ impl TransportFactory {
                 Some(bridge) => Box::new(shadowsocks::Shadowsocks::new(socket, relay, bridge)?),
                 None => return Err("shadowsocks without a bridge endpoint".into()),
             },
+            "lwo" => Box::new(lwo::Lwo::new(socket, relay, peer_key, settings)?),
             other => return Err(format!("unknown transport '{other}'")),
         };
         Ok(Self { transport })
+    }
+
+    /// Timer overrides the chosen transport needs from the engine, if any (LWO v2).
+    pub fn timer_params(&self) -> Option<TimerParams> {
+        self.transport.timer_params()
     }
 }
 

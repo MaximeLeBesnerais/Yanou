@@ -257,7 +257,18 @@ pub extern "C" fn mh_tunnel_start(
 
         let udp_socket = tokio::net::UdpSocket::from_std(std_socket)
             .map_err(|error| format!("relay socket: {error}"))?;
-        let transport = TransportFactory::new(udp_socket, endpoint, bridge, &transport_name, &transport_settings)?;
+        // The relay's public key is the LWO obfuscation key; the other transports ignore it.
+        let transport = TransportFactory::new(
+            udp_socket,
+            endpoint,
+            bridge,
+            &transport_name,
+            &transport_settings,
+            Some(relay_key.to_bytes()),
+        )?;
+        // LWO v2 asks for timers that match the relay's obfuscation; gotatun can only
+        // apply them when the peer is built, below.
+        let peer_timers = transport.timer_params();
 
         let mut config = tun::Configuration::default();
         config.raw_fd(fd).mtu(mtu as u16).close_fd_on_drop(false);
@@ -289,6 +300,10 @@ pub extern "C" fn mh_tunnel_start(
             .with_allowed_ips(allowed_ips);
         // Mullvad relays expect a keepalive; NAT traversal without one is unreliable.
         relay.keepalive = Some(25);
+        if let Some(timers) = peer_timers {
+            log_line("tunnel: applying the LWO v2 WireGuard timers");
+            relay = relay.dangerously_with_timer_params(timers);
+        }
 
         let device = Arc::new(
             DeviceBuilder::new()
