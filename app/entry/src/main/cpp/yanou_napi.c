@@ -32,6 +32,8 @@ extern int32_t mh_tunnel_start(int32_t fd, int32_t mtu, const char* peer_key, co
     char* out, int32_t capacity);
 extern int32_t mh_tunnel_status(char* out, int32_t capacity);
 extern void mh_tunnel_stop(void);
+extern int32_t mh_negotiate_daita(int32_t fd, const char* parent_pubkey,
+    const char* ephemeral_pubkey, char* out, int32_t capacity);
 extern void mh_set_diagnostics(int32_t enabled);
 extern void mh_set_ip_version(int32_t families);
 extern int32_t mh_log_marker(const char* text);
@@ -190,6 +192,91 @@ static napi_value StartApiJob(napi_env env, napi_callback_info info, int kind, i
     napi_value name;
     napi_create_string_utf8(env, "yanouApi", NAPI_AUTO_LENGTH, &name);
     napi_create_async_work(env, NULL, name, ExecuteApi, CompleteApi, job, &job->work);
+    napi_queue_async_work(env, job->work);
+    return promise;
+}
+
+/*
+ * DAITA negotiation blocks on the config service, so it runs on a libuv worker thread
+ * like the API calls. The fd comes from TCPSocket.getSocketFd(); the native side dup()s
+ * it and leaves the ArkTS socket's lifecycle alone.
+ */
+typedef struct {
+    napi_async_work work;
+    napi_deferred deferred;
+    int32_t fd;
+    char parent[128];
+    char ephemeral[128];
+    char* out;
+    int capacity;
+} DaitaJob;
+
+/* The JSON carries the maybenot machines, which are verbose; keep plenty of room. */
+#define DAITA_RESULT_CAPACITY 32768
+
+static void ExecuteDaita(napi_env env, void* data)
+{
+    (void)env;
+    DaitaJob* job = (DaitaJob*)data;
+    mh_negotiate_daita(job->fd, job->parent, job->ephemeral, job->out, job->capacity);
+}
+
+static void CompleteDaita(napi_env env, napi_status status, void* data)
+{
+    DaitaJob* job = (DaitaJob*)data;
+    napi_value result;
+    if (status != napi_ok || job->out[0] == '\0') {
+        napi_create_string_utf8(env, "{\"ok\":false,\"error\":\"native call failed\"}",
+            NAPI_AUTO_LENGTH, &result);
+    } else {
+        napi_create_string_utf8(env, job->out, NAPI_AUTO_LENGTH, &result);
+    }
+    napi_resolve_deferred(env, job->deferred, result);
+    napi_delete_async_work(env, job->work);
+    free(job->out);
+    free(job);
+}
+
+static napi_value WrapNegotiateDaita(napi_env env, napi_callback_info info)
+{
+    size_t argc = 3;
+    napi_value argv[3] = { 0 };
+    napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+
+    DaitaJob* job = (DaitaJob*)calloc(1, sizeof(DaitaJob));
+    if (job == NULL) {
+        napi_value result;
+        napi_create_string_utf8(env, "{\"ok\":false,\"error\":\"out of memory\"}", NAPI_AUTO_LENGTH,
+            &result);
+        return result;
+    }
+    job->fd = -1;
+    job->capacity = DAITA_RESULT_CAPACITY;
+    job->out = (char*)calloc(1, (size_t)job->capacity);
+    if (job->out == NULL) {
+        free(job);
+        napi_value result;
+        napi_create_string_utf8(env, "{\"ok\":false,\"error\":\"out of memory\"}", NAPI_AUTO_LENGTH,
+            &result);
+        return result;
+    }
+
+    size_t length = 0;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &job->fd);
+    }
+    if (argc >= 2) {
+        napi_get_value_string_utf8(env, argv[1], job->parent, sizeof(job->parent), &length);
+    }
+    if (argc >= 3) {
+        napi_get_value_string_utf8(env, argv[2], job->ephemeral, sizeof(job->ephemeral), &length);
+    }
+
+    napi_value promise;
+    napi_create_promise(env, &job->deferred, &promise);
+    napi_value name;
+    napi_create_string_utf8(env, "yanouDaita", NAPI_AUTO_LENGTH, &name);
+    napi_create_async_work(env, NULL, name, ExecuteDaita, CompleteDaita, job, &job->work);
     napi_queue_async_work(env, job->work);
     return promise;
 }
@@ -476,6 +563,7 @@ static napi_value Init(napi_env env, napi_value exports)
         { "tunnelStart", NULL, WrapTunnelStart, NULL, NULL, NULL, napi_default, NULL },
         { "tunnelStatus", NULL, WrapTunnelStatus, NULL, NULL, NULL, napi_default, NULL },
         { "tunnelStop", NULL, WrapTunnelStop, NULL, NULL, NULL, napi_default, NULL },
+        { "negotiateDaita", NULL, WrapNegotiateDaita, NULL, NULL, NULL, napi_default, NULL },
         { "setDiagnostics", NULL, WrapSetDiagnostics, NULL, NULL, NULL, napi_default, NULL },
         { "setIpVersion", NULL, WrapSetIpVersion, NULL, NULL, NULL, napi_default, NULL },
         { "logMarker", NULL, WrapLogMarker, NULL, NULL, NULL, napi_default, NULL },

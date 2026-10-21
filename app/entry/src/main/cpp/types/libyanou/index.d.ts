@@ -99,6 +99,22 @@ export const tunnelStatus: () => string;
 
 export const tunnelStop: () => void;
 
+/**
+ * Negotiates a DAITA peer with the relay's config service through an existing tunnel.
+ *
+ * `fd` is a connected TCP socket to `10.64.0.1:1337` obtained from
+ * `TCPSocket.getSocketFd()` *without* `protect()`, so its packets enter the tun and reach
+ * the ingress relay. `parentPubkey` is the public key of the running tunnel; pass an
+ * empty `ephemeralPubkey` to let the native side generate a throwaway keypair.
+ *
+ * Resolves to `{"ok":true,"psk":"...","machines":[...],"maxPadding":x,"maxBlocking":y,
+ * "ephemeralKey":"...","ephemeralPublicKey":"..."}` or `{"ok":false,"error":"..."}`.
+ * `ephemeralKey` is the private key to pass back in `tunnelStart`'s settings; it is a
+ * session key and must never be stored.
+ */
+export const negotiateDaita: (fd: number, parentPubkey: string,
+  ephemeralPubkey: string) => Promise<string>;
+
 /** Diagnostics logging is opt-in; off by default. */
 export const setDiagnostics: (enabled: boolean) => void;
 
