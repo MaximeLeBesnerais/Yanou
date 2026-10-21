@@ -34,6 +34,31 @@ const TOKEN_MARGIN_MS: number = 5 * 60 * 1000;
 const VPN_NOTIFICATION_ID: number = 1001;
 /** One-shot notification when automatic reconnect gives up. */
 const FAILURE_NOTIFICATION_ID: number = 1002;
+/**
+ * Base tun MTU, mirrored from `VpnExtensionAbility`: a single-hop tunnel uses it. A
+ * multihop tunnel spends one more WireGuard header per packet and lowers it.
+ */
+const TUN_MTU: number = 1420;
+/** Bytes the second WireGuard header adds: outer IP, UDP and the WireGuard data header. */
+const MULTIHOP_IPV4_OVERHEAD: number = 60;
+const MULTIHOP_IPV6_OVERHEAD: number = 80;
+/** Below this, IPv6 stops working; a multihop tunnel never configures a smaller MTU. */
+const MIN_MULTIHOP_MTU: number = 1280;
+
+/**
+ * The exit relay of a multihop connection.
+ *
+ * Kept apart from `RelaySelection` because an exit is always one specific relay: there is
+ * no "any relay in this country" exit, and the entry choice stays where it is.
+ */
+interface ExitChoice {
+  hostname: string;
+  ipv4: string;
+  ipv6: string;
+  publicKey: string;
+  city: string;
+  country: string;
+}
 
 function formatBytes(value: number): string {
   if (value < 1024) {
@@ -160,6 +185,10 @@ struct Index {
   /** A cache written before relays carried `ipv6` has to be refetched. */
   @State cacheNeedsRefresh: boolean = false;
   @State selection: RelaySelection | null = null;
+  /** Multihop exit relay; independent of the entry `selection` above. */
+  @State exitSelection: ExitChoice | null = null;
+  /** What the server browser is editing: the entry relay (`entry`) or the exit (`exit`). */
+  @State serverMode: string = 'entry';
   @State logText: string = '';
   @State diagEntries: DiagEntry[] = [];
   @State openEntry: DiagEntry | null = null;
@@ -226,13 +255,21 @@ struct Index {
   private async restoreSelection(): Promise<void> {
     const raw: string = await VpnSettings.getString(getContext(this) as common.Context,
       'selectedRelay', '');
-    if (raw.length === 0) {
-      return;
+    if (raw.length > 0) {
+      try {
+        this.selection = JSON.parse(raw) as RelaySelection;
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'bad stored relay selection');
+      }
     }
-    try {
-      this.selection = JSON.parse(raw) as RelaySelection;
-    } catch (e) {
-      hilog.warn(DOMAIN, TAG, 'bad stored relay selection');
+    const exitRaw: string = await VpnSettings.getString(getContext(this) as common.Context,
+      'exitRelay', '');
+    if (exitRaw.length > 0) {
+      try {
+        this.exitSelection = JSON.parse(exitRaw) as ExitChoice;
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'bad stored exit relay');
+      }
     }
     this.recentsJson = await VpnSettings.getString(getContext(this) as common.Context,
       'recents', '[]');
@@ -359,7 +396,12 @@ struct Index {
     return this.usageMap().get(country) ?? 0;
   }
 
-  private async openServers(): Promise<void> {
+  /**
+   * Opens the relay browser. `mode` is `entry` for the current selection, or `exit` for
+   * the multihop exit; the same list, rows and filters are reused for both.
+   */
+  private async openServers(mode: string = 'entry'): Promise<void> {
+    this.serverMode = mode;
     this.loadCachedRelays();
     this.pageStack.pushPath({ name: 'servers' });
     const stamp: string = await VpnSettings.getString(getContext(this) as common.Context,
@@ -457,6 +499,36 @@ struct Index {
     await this.connectSelection(null);
   }
 
+  /**
+   * Saves the exit relay. A live tunnel is rebuilt so the new circuit takes effect now;
+   * the entry selection is untouched.
+   */
+  private async selectExitRelay(relay: RelayItem): Promise<void> {
+    await this.applyExitChoice({
+      hostname: relay.hostname,
+      ipv4: relay.ipv4,
+      ipv6: relay.ipv6,
+      publicKey: relay.publicKey,
+      city: relay.city,
+      country: relay.country
+    });
+  }
+
+  /** Clears the exit: multihop stays enabled but the tunnel falls back to single hop. */
+  private async clearExit(): Promise<void> {
+    await this.applyExitChoice(null);
+  }
+
+  private async applyExitChoice(choice: ExitChoice | null): Promise<void> {
+    this.exitSelection = choice;
+    await VpnSettings.setString(getContext(this) as common.Context, 'exitRelay',
+      choice === null ? '' : JSON.stringify(choice));
+    this.pageStack.pop();
+    if (this.sessionActive()) {
+      await this.reconnectTunnel();
+    }
+  }
+
   /** Counts a country use, which also decides the order of the list. */
   private bumpUsage(country: string): void {
     if (country.length === 0) {
@@ -480,6 +552,51 @@ struct Index {
       return `${this.selection.country} · automatic`;
     }
     return this.selection.hostname;
+  }
+
+  /** True when the UI asked for multihop and an exit relay is actually selected. */
+  private multihopActive(): boolean {
+    return this.prefs.multihop && this.exitSelection !== null;
+  }
+
+  /** Primary address of the exit, matching the extension's choice (IPv4 first). */
+  private exitAddress(): string {
+    if (this.exitSelection === null) {
+      return '';
+    }
+    return this.exitSelection.ipv4.length > 0 ? this.exitSelection.ipv4 : this.exitSelection.ipv6;
+  }
+
+  /** Human label for the selected exit: city and country when known, else the host. */
+  private exitLabel(): string {
+    if (this.exitSelection === null) {
+      return 'Not selected';
+    }
+    if (this.exitSelection.city.length > 0) {
+      return `${this.exitSelection.city}, ${this.exitSelection.country}`;
+    }
+    return this.exitSelection.hostname;
+  }
+
+  /** MTU the extension will configure: one header less for multihop, floored at 1280. */
+  private effectiveMtu(): number {
+    if (!this.multihopActive()) {
+      return TUN_MTU;
+    }
+    const overhead: number = this.exitAddress().includes(':') ?
+      MULTIHOP_IPV6_OVERHEAD : MULTIHOP_IPV4_OVERHEAD;
+    return Math.max(MIN_MULTIHOP_MTU, TUN_MTU - overhead);
+  }
+
+  /** One line for the tunnel configuration card, never claims a circuit that is not set. */
+  private multihopSummary(): string {
+    if (!this.prefs.multihop) {
+      return 'Multihop off';
+    }
+    if (this.exitSelection === null) {
+      return 'Multihop on · no exit selected (single hop)';
+    }
+    return `Multihop · exit ${this.exitLabel()}`;
   }
 
   private readLogs(): void {
@@ -1286,6 +1403,16 @@ struct Index {
       // told about diagnostics itself, before it writes the connection marker.
       'diagnostics': this.diagnosticsEnabled
     };
+    // Multihop exit. Only sent while the toggle is on and a relay is chosen: the extension
+    // treats the absence of these fields as a single-hop connection, which is what a
+    // half-configured multihop must behave like.
+    const exit: ExitChoice | null = this.exitSelection;
+    if (this.prefs.multihop && exit !== null) {
+      parameters['exitHostname'] = exit.hostname;
+      parameters['exitIpv4'] = exit.ipv4;
+      parameters['exitIpv6'] = exit.ipv6;
+      parameters['exitKey'] = exit.publicKey;
+    }
     return {
       bundleName: VPN_BUNDLE,
       abilityName: VPN_ABILITY,
@@ -1380,7 +1507,8 @@ struct Index {
       this.otherRelayTried = false;
       this.keepAliveFailures = 0;
       const candidates: RelayItem[] = this.candidatesForSelection();
-      native.logLine(`connect: ${this.relayLabel()} · ${candidates.length} candidate(s)` +
+      const circuit: string = this.multihopActive() ? ` · exit ${this.exitLabel()}` : '';
+      native.logLine(`connect: ${this.relayLabel()}${circuit} · ${candidates.length} candidate(s)` +
         (candidates.length > 0 ? ` · first ${candidates[0].hostname} (${candidates[0].ipv4})` : ''));
       await vpnExtension.startVpnExtensionAbility(this.vpnWant());
       this.phase = 'connecting';
@@ -1992,6 +2120,34 @@ struct Index {
               this.openServers();
             })
 
+            // The entry stays the "Servers" row; multihop only adds the second hop here.
+            if (this.prefs.multihop) {
+              Divider()
+                .strokeWidth(0.5)
+                .color($r('sys.color.comp_divider'))
+              Row() {
+                Text('Exit')
+                  .fontSize(15)
+                  .fontColor($r('sys.color.font_primary'))
+                Blank()
+                Text(this.exitSelection === null ? 'Not selected' : this.exitLabel())
+                  .fontSize(13)
+                  .fontColor(this.exitSelection === null ?
+                    $r('sys.color.font_tertiary') : $r('sys.color.brand'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                SymbolGlyph($r('sys.symbol.chevron_right'))
+                  .fontSize(16)
+                  .fontColor([$r('sys.color.font_tertiary')])
+                  .margin({ left: 4 })
+              }
+              .width('100%')
+              .height(48)
+              .onClick(() => {
+                this.openServers('exit');
+              })
+            }
+
           }
           .width('100%')
           .padding({ left: 16, right: 16 })
@@ -2003,12 +2159,18 @@ struct Index {
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
-            Text(`vNIC ${this.session?.ipv4 ?? '-'} · MTU 1420 · DNS 10.64.0.1`)
+            Text(`vNIC ${this.session?.ipv4 ?? '-'} · MTU ${this.effectiveMtu()} · DNS 10.64.0.1`)
               .fontSize(13)
               .fontColor($r('sys.color.font_tertiary'))
             Text(`${this.ipModeLabel()} · kill switch ${this.prefs.killSwitch ? 'on' : 'off'}`)
               .fontSize(13)
               .fontColor($r('sys.color.font_tertiary'))
+            Text(this.multihopSummary())
+              .fontSize(13)
+              .fontColor(this.multihopActive() ?
+                $r('sys.color.brand') : $r('sys.color.font_tertiary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
           .width('100%')
           .padding(16)
@@ -2382,6 +2544,26 @@ struct Index {
 
   // ---------------------------------------------------- server browser helpers
 
+  /** Checkmark state: in exit mode it compares the exit, otherwise the entry selection. */
+  private srvIsSelected(relay: RelayItem): boolean {
+    if (this.serverMode === 'exit') {
+      return this.exitSelection !== null && this.exitSelection.hostname === relay.hostname;
+    }
+    return this.selection !== null && this.selection.hostname === relay.hostname;
+  }
+
+  /**
+   * One row, two meanings: in entry mode it connects through the relay, in exit mode it
+   * only saves the exit and rebuilds the tunnel if one is up.
+   */
+  private async srvTapRelay(relay: RelayItem): Promise<void> {
+    if (this.serverMode === 'exit') {
+      await this.selectExitRelay(relay);
+    } else {
+      await this.selectRelay(relay);
+    }
+  }
+
   /** True when the relay passes the active filter chip. Search is applied separately. */
   private srvMatchesFilter(relay: RelayItem): boolean {
     if (this.srvFilter === 'daita') {
@@ -2586,7 +2768,7 @@ struct Index {
             .fontColor($r('sys.color.brand'))
         }
 
-        if (this.selection !== null && this.selection.hostname === relay.hostname) {
+        if (this.srvIsSelected(relay)) {
           SymbolGlyph($r('sys.symbol.bolt_shield'))
             .fontSize(16)
             .fontColor([$r('sys.color.brand')])
@@ -2595,7 +2777,7 @@ struct Index {
       .layoutWeight(1)
       .height(56)
       .onClick(() => {
-        this.selectRelay(relay);
+        this.srvTapRelay(relay);
       })
 
       // The checkmark doubles as the favourite toggle: tap it to pin or unpin a relay.
@@ -2647,8 +2829,10 @@ struct Index {
             .textAlign(TextAlign.Center)
         }
 
-        if (this.selection !== null && this.selection.kind === 'country' &&
-          this.selection.country === country) {
+        // In exit mode an exit is always a concrete relay: the country's "Auto" shortcut
+        // has no meaning there, so the row only expands to its relays.
+        if (this.serverMode === 'entry' && this.selection !== null &&
+          this.selection.kind === 'country' && this.selection.country === country) {
           SymbolGlyph($r('sys.symbol.checkmark'))
             .fontSize(16)
             .fontColor([$r('sys.color.brand')])
@@ -2665,18 +2849,20 @@ struct Index {
         this.expandedCountry = this.expandedCountry === country ? '' : country;
       })
 
-      Button() {
-        Text('Auto')
-          .fontSize(13)
-          .fontColor($r('sys.color.brand'))
+      if (this.serverMode === 'entry') {
+        Button() {
+          Text('Auto')
+            .fontSize(13)
+            .fontColor($r('sys.color.brand'))
+        }
+        .type(ButtonType.Capsule)
+        .height(32)
+        .padding({ left: 14, right: 14 })
+        .backgroundColor($r('sys.color.comp_background_secondary'))
+        .onClick(() => {
+          this.selectCountry(country);
+        })
       }
-      .type(ButtonType.Capsule)
-      .height(32)
-      .padding({ left: 14, right: 14 })
-      .backgroundColor($r('sys.color.comp_background_secondary'))
-      .onClick(() => {
-        this.selectCountry(country);
-      })
     }
     .width('100%')
   }
@@ -2685,18 +2871,20 @@ struct Index {
   automaticRow() {
     Row() {
       Column({ space: 2 }) {
-        Text('Automatic')
+        Text(this.serverMode === 'exit' ? 'No exit' : 'Automatic')
           .fontSize(15)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_primary'))
-        Text('Any country · tries relays until one answers')
+        Text(this.serverMode === 'exit' ?
+          'Single hop · traffic leaves through the entry relay' :
+          'Any country · tries relays until one answers')
           .fontSize(11)
           .fontColor($r('sys.color.font_secondary'))
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
 
-      if (this.selection === null) {
+      if (this.serverMode === 'exit' ? this.exitSelection === null : this.selection === null) {
         SymbolGlyph($r('sys.symbol.checkmark'))
           .fontSize(18)
           .fontColor([$r('sys.color.brand')])
@@ -2709,7 +2897,11 @@ struct Index {
     .width('100%')
     .height(56)
     .onClick(() => {
-      this.selectAutomatic();
+      if (this.serverMode === 'exit') {
+        this.clearExit();
+      } else {
+        this.selectAutomatic();
+      }
     })
   }
 
@@ -2876,7 +3068,9 @@ struct Index {
   @Builder
   srvSearchResults() {
     Column() {
-      if (this.srvMatchingCountries().length > 0) {
+      // An exit is one specific relay: the country and city shortcuts only make sense
+      // while choosing the entry, so exit mode searches relays only.
+      if (this.serverMode === 'entry' && this.srvMatchingCountries().length > 0) {
         this.srvSectionHeader('Countries')
         ForEach(this.srvMatchingCountries(), (country: string) => {
           this.srvSearchCountryRow(country)
@@ -2884,7 +3078,7 @@ struct Index {
         this.srvDivider()
       }
 
-      if (this.srvMatchingCities().length > 0) {
+      if (this.serverMode === 'entry' && this.srvMatchingCities().length > 0) {
         this.srvSectionHeader('Cities')
         ForEach(this.srvMatchingCities(), (relay: RelayItem) => {
           this.srvSearchCityRow(relay)
@@ -2893,15 +3087,17 @@ struct Index {
       }
 
       if (this.srvMatchingRelays().length > 0) {
-        this.srvSectionHeader('Relays')
+        this.srvSectionHeader(this.serverMode === 'exit' ? 'Exit relays' : 'Relays')
         ForEach(this.srvMatchingRelays(), (relay: RelayItem) => {
           this.relayRow(relay)
         }, (relay: RelayItem) =>
-          `srv-r-${relay.hostname}-${this.selection?.hostname ?? ''}-${this.srvIsFavourite(relay.hostname) ? '1' : '0'}`)
+          `srv-r-${relay.hostname}-${this.serverMode}-${this.selection?.hostname ?? ''}-` +
+          `${this.exitSelection?.hostname ?? ''}-${this.srvIsFavourite(relay.hostname) ? '1' : '0'}`)
       }
 
-      if (this.srvMatchingCountries().length === 0 && this.srvMatchingCities().length === 0 &&
-        this.srvMatchingRelays().length === 0) {
+      if (this.srvMatchingRelays().length === 0 &&
+        (this.serverMode !== 'entry' ||
+          (this.srvMatchingCountries().length === 0 && this.srvMatchingCities().length === 0))) {
         Text('No relay, city or country matches this search.')
           .fontSize(13)
           .fontColor($r('sys.color.font_tertiary'))
@@ -2952,7 +3148,22 @@ struct Index {
   @Builder
   serversScreen() {
     Column() {
-      if (this.sessionActive() && this.tunnelTarget.length > 0) {
+      if (this.serverMode === 'exit') {
+        Column({ space: 4 }) {
+          Text('Choose the exit relay')
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
+          Text('Traffic enters through the selected entry relay and leaves through this one, ' +
+            'so neither relay sees both the device and the destination.')
+            .fontSize(12)
+            .fontColor($r('sys.color.font_secondary'))
+            .lineHeight(17)
+        }
+        .width('100%')
+        .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 8, bottom: 2 })
+        .alignItems(HorizontalAlign.Start)
+      } else if (this.sessionActive() && this.tunnelTarget.length > 0) {
         Column() {
           this.srvConnectedCard()
         }
@@ -2961,7 +3172,10 @@ struct Index {
       }
 
       Row() {
-        TextInput({ placeholder: 'Search country, city or relay', text: this.search })
+        TextInput({
+          placeholder: this.serverMode === 'exit' ? 'Search exit relay' : 'Search country, city or relay',
+          text: this.search
+        })
           .height(40)
           .fontSize(14)
           .backgroundColor($r('sys.color.comp_background_secondary'))
@@ -4326,21 +4540,58 @@ struct Index {
               Column({ space: 2 }) {
                 Text('Multihop')
                   .fontSize(15)
-                  .fontColor($r('sys.color.font_tertiary'))
-                Text('Needs the relay list')
+                  .fontColor($r('sys.color.font_primary'))
+                Text(!this.prefs.multihop ?
+                  'Send traffic through an entry relay, then a separate exit relay' :
+                  (this.exitSelection === null ? 'On · choose an exit relay' :
+                    `Exit ${this.exitLabel()}`))
                   .fontSize(12)
-                  .fontColor($r('sys.color.font_tertiary'))
+                  .fontColor($r('sys.color.font_secondary'))
+                  .maxLines(2)
               }
               .alignItems(HorizontalAlign.Start)
               .layoutWeight(1)
 
-              Toggle({ type: ToggleType.Switch, isOn: false })
-                .enabled(false)
+              Toggle({ type: ToggleType.Switch, isOn: this.prefs.multihop })
                 .selectedColor($r('sys.color.brand'))
+                .onChange((isOn: boolean) => {
+                  this.prefs.multihop = isOn;
+                  this.setPref('multihop', isOn);
+                })
             }
             .width('100%')
-            .height(60)
-            .opacity(0.5)
+            .padding({ top: 10, bottom: 10 })
+
+            if (this.prefs.multihop) {
+              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+
+              Row() {
+                Column({ space: 2 }) {
+                  Text('Exit relay')
+                    .fontSize(15)
+                    .fontColor($r('sys.color.font_primary'))
+                  Text(this.exitSelection === null ?
+                    'Not selected · traffic still leaves through the entry relay' :
+                    `${this.exitSelection.hostname} · ${this.exitLabel()}`)
+                    .fontSize(12)
+                    .fontColor(this.exitSelection === null ?
+                      $r('sys.color.font_tertiary') : $r('sys.color.font_secondary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
+                .alignItems(HorizontalAlign.Start)
+                .layoutWeight(1)
+
+                SymbolGlyph($r('sys.symbol.chevron_right'))
+                  .fontSize(16)
+                  .fontColor([$r('sys.color.font_tertiary')])
+              }
+              .width('100%')
+              .height(60)
+              .onClick(() => {
+                this.openServers('exit');
+              })
+            }
           }
           .width('calc(100% - 32vp)')
           .padding({ left: 16, right: 16 })
@@ -4449,7 +4700,7 @@ struct Index {
       .alignItems(VerticalAlign.Top)
     }
     .title(name === 'devices' ? 'Devices' :
-      (name === 'servers' ? 'Servers' :
+      (name === 'servers' ? (this.serverMode === 'exit' ? 'Exit relay' : 'Servers') :
         (name === 'logs' ? 'Diagnostics' :
           (name === 'entry' ? 'Connection' :
             (name === 'account' ? 'Account' : (name === 'about' ? 'About' : 'VPN settings'))))))
