@@ -1,21 +1,21 @@
 # 燕鸥 (Yàn'ōu)
 
-燕鸥 is a **WireGuard client** for HarmonyOS NEXT that connects to Mullvad VPN. It is a
-client and nothing else: it runs no servers, sells no subscription and has no account of
-its own. You sign in with a Mullvad account you already hold; the app registers a WireGuard
-device with `api.mullvad.net`, downloads Mullvad's signed relay list, and routes device
-traffic through a selected relay using the system VPN extension. The relays, the account
-and its five-device limit all belong to Mullvad.
+**燕鸥 is a WireGuard client for HarmonyOS NEXT that connects to Mullvad VPN.** It uses a
+Mullvad account you already hold: the app registers a WireGuard device with Mullvad's API,
+downloads the signed relay list, and routes device traffic through the selected relay with
+the system VPN extension.
 
-Mullvad does not provide an official client for HarmonyOS, which is why this app exists. It
-is an unofficial **student project, not a company**, and it is not affiliated with,
-endorsed by or supported by Mullvad VPN AB. "Mullvad" is used only to describe the service
-this client connects to.
+It is a client only. It runs no servers, sells no subscriptions and holds no accounts; the
+relays, the account and its five-device limit belong to Mullvad.
 
-**If anyone sold you a subscription, an account or "Mullvad access" through this app or
-through any third party, you were scammed.** This app never sells anything. Mullvad accounts
-are sold only by Mullvad, at <https://mullvad.net>. There are no terms of service here,
-because there is no service: use it with your own account and at your own risk.
+Mullvad does not provide an official client for HarmonyOS. 燕鸥 is an independent,
+third-party client for that platform, and it is not affiliated with, endorsed by or
+supported by Mullvad VPN AB.
+
+Mullvad accounts are sold only by Mullvad, at <https://mullvad.net>. If anyone sold you a
+subscription, an account or "Mullvad access" through this app or through any third party,
+you were scammed. The app sells nothing and has no terms of service, because it is not a
+service.
 
 The client handles two kinds of filtered network. When `api.mullvad.net` is DNS-poisoned,
 the API is reached through Mullvad's domain-fronting protocol rather than a direct HTTPS

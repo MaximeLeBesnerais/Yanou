@@ -1681,9 +1681,9 @@ struct Index {
             .fontSize(16)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_primary'))
-          Text('Mullvad does not provide an official client for HarmonyOS, so this app fills that ' +
-            'gap. It is an unofficial student project, not a company, and it is not affiliated ' +
-            'with, endorsed by or supported by Mullvad VPN AB.')
+          Text('Mullvad does not provide an official client for HarmonyOS. 燕鸥 is an independent, ' +
+            'third-party client for HarmonyOS NEXT, and it is not affiliated with, endorsed by or ' +
+            'supported by Mullvad VPN AB.')
             .fontSize(14)
             .lineHeight(21)
             .fontColor($r('sys.color.font_secondary'))
