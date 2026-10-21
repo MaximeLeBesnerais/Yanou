@@ -739,4 +739,82 @@ mod tests {
         };
         assert!(negotiated.settings().is_err());
     }
+
+    /// Drives the real h2 client against a local HTTP/2 server: proves the request
+    /// framing, headers, body, trailer handling and response decoding fit together, not
+    /// just the protobuf codecs in isolation.
+    #[test]
+    fn grpc_exchange_works_against_a_local_h2_server() {
+        use http::{HeaderMap, Response};
+        use tokio::net::TcpListener;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("local addr");
+            let parent = [0x11u8; 32];
+            let ephemeral = [0x22u8; 32];
+
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut connection = h2::server::handshake(stream).await.expect("server h2");
+                let (request, mut respond) = connection
+                    .accept()
+                    .await
+                    .expect("connection stays open")
+                    .expect("one request");
+                assert_eq!(request.method(), http::Method::POST);
+                assert_eq!(request.uri().path(), GRPC_PATH);
+                assert_eq!(
+                    request.headers().get(header::CONTENT_TYPE).expect("content-type"),
+                    "application/grpc"
+                );
+                assert_eq!(request.headers().get("te").expect("te"), "trailers");
+
+                let mut body = request.into_body();
+                let mut data = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    data.extend_from_slice(&chunk.expect("request body"));
+                }
+                assert_eq!(data, encode_grpc_message(&encode_request(&parent, &ephemeral)));
+
+                let mut daita = Vec::new();
+                daita.extend_from_slice(&[0x0a, 0x04]);
+                daita.extend_from_slice(b"test");
+                daita.push(0x11);
+                daita.extend_from_slice(&double_bytes(0.125));
+                daita.push(0x19);
+                daita.extend_from_slice(&double_bytes(0.5));
+                let mut payload = vec![0x12, daita.len() as u8];
+                payload.extend_from_slice(&daita);
+
+                let response = Response::builder()
+                    .status(200)
+                    .header(header::CONTENT_TYPE, "application/grpc")
+                    .body(())
+                    .expect("response");
+                let mut send = respond.send_response(response, false).expect("send response");
+                send.send_data(Bytes::from(encode_grpc_message(&payload)), false)
+                    .expect("send data");
+                let mut trailers = HeaderMap::new();
+                trailers.insert("grpc-status", "0".parse().expect("status value"));
+                send.send_trailers(trailers).expect("send trailers");
+                // The server connection has to be driven until the client has read the
+                // trailers; dropping it immediately resets the stream before the last
+                // frames leave the socket.
+                let _ = tokio::time::timeout(Duration::from_secs(1), connection.accept()).await;
+            });
+
+            let stream = TcpStream::connect(address).await.expect("connect");
+            let result = negotiate_over_stream(stream, parent, ephemeral).await;
+            server.await.expect("server task");
+            let negotiated = result.expect("negotiate");
+            assert_eq!(negotiated.machines, vec!["test".to_string()]);
+            assert_eq!(negotiated.max_padding.to_bits(), 0.125f64.to_bits());
+            assert_eq!(negotiated.max_blocking.to_bits(), 0.5f64.to_bits());
+        });
+    }
 }
