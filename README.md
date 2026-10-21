@@ -63,10 +63,11 @@ scam.
 - Automatic rekey before the WireGuard session expires, and watchdogs for a stalled tunnel.
 - Diagnostics: one log section per connection attempt, viewable in the app and exportable.
 
-Not implemented: DAITA, multihop, LWO, QUIC/MASQUE, udp2tcp, per-application tunnelling,
-DNS content blocking and custom DNS. The DAITA switch currently only filters the relay list
-to relays that advertise support. `PORT-PLAN.md` section 7 describes what each would
-require.
+Not implemented: DAITA, multihop, LWO, QUIC/MASQUE, udp2tcp, DNS content blocking and custom
+DNS. The DAITA switch currently only filters the relay list to relays that advertise support.
+[`PORT-PLAN.md`](PORT-PLAN.md) section 7 has a plan for each. Per-application tunnelling is
+excluded: HarmonyOS does not let a normal app enumerate installed applications, so the picker
+cannot exist.
 
 ## Requirements
 
