@@ -3,7 +3,7 @@ import { Want } from '@kit.AbilityKit';
 import { commonEventManager, BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import native from 'libyanou.so';
-import { WireGuardKey } from '../api/MullvadApi';
+import { RelayQuic, WireGuardKey } from '../api/MullvadApi';
 import {
   VpnStatePayload, TunnelStatus, parseTunnelStats, parseTunnelStatus, VPN_STATE_EVENT
 } from '../common/VpnEvents';
@@ -53,15 +53,34 @@ const NO_HANDSHAKE_AGE_MS: number = 3600000;
 const REBUILD_GAP_MS: number = 2000;
 
 /**
+ * One rung of the transport ladder: which family to dial, and whether the datagrams go
+ * through a bridge with Shadowsocks instead of straight to the relay.
+ */
+interface TransportDescriptor {
+  /** Stable name used in diagnostics; one transport may have one entry per family. */
+  id: string;
+  /** Which transport the native core builds for this attempt. */
+  kind: 'direct' | 'shadowsocks';
+  family: 'v4' | 'v6';
+  /** True when the attempt goes through Mullvad's Shadowsocks bridges. */
+  obfuscated: boolean;
+}
+
+/**
  * Transport ladder, mirroring the official client's `RETRY_ORDER`: the plain IPv6 path
  * first (the only one that survives a filtered IPv4 network), then IPv4, then the same
  * two families through Mullvad's Shadowsocks obfuscation. Every entry is retried with a
  * fresh port and, once the relay list is exhausted, a fresh relay.
+ *
+ * The protocol preference filters this table. Adding a transport is one entry here plus
+ * the code that dials it — never another branch in `startCandidate`.
  */
-const LADDER: string[] = ['direct-v6', 'shadowsocks-v4', 'direct-v4', 'shadowsocks-v6'];
-/** The same ladder restricted to one transport family, for the protocol preference. */
-const LADDER_DIRECT: string[] = ['direct-v6', 'direct-v4'];
-const LADDER_OBFUSCATED: string[] = ['shadowsocks-v4', 'shadowsocks-v6'];
+const TRANSPORTS: TransportDescriptor[] = [
+  { id: 'direct-v6', kind: 'direct', family: 'v6', obfuscated: false },
+  { id: 'shadowsocks-v4', kind: 'shadowsocks', family: 'v4', obfuscated: true },
+  { id: 'direct-v4', kind: 'direct', family: 'v4', obfuscated: false },
+  { id: 'shadowsocks-v6', kind: 'shadowsocks', family: 'v6', obfuscated: true }
+];
 /** Shadowsocks ports published by the relay list (`wireguard.shadowsocks_port_ranges`). */
 const SS_PORT_MIN: number = 51900;
 const SS_PORT_MAX: number = 51949;
@@ -82,6 +101,11 @@ interface RelayCandidate {
   /** Dedicated Shadowsocks addresses published by the relay list. */
   ssExtra: string[];
   publicKey: string;
+  /** LWO v1/v2 capability; absent from candidates built by an older UI. */
+  lwo?: boolean;
+  lwoV2?: boolean;
+  /** QUIC/MASQUE proxy details; absent when the relay publishes none. */
+  quic?: RelayQuic;
 }
 
 export default class YanouVpnAbility extends VpnExtensionAbility {
@@ -107,7 +131,7 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
   /** "ipv4", "ipv6" or "auto": which family the engine forwards. */
   private ipVersion: string = 'ipv4';
   /** Transport ladder for this connection, chosen by the protocol preference. */
-  private ladder: string[] = LADDER;
+  private ladder: TransportDescriptor[] = TRANSPORTS;
   private rxBytes: number = 0;
   private txBytes: number = 0;
   /** What the attempt in flight is doing, so the UI can say more than "Connecting". */
@@ -286,12 +310,12 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       // Protocol preference: Automatic walks every transport, otherwise only one family.
       try {
         const mode: string = await VpnSettings.getString(this.context, 'protocolMode', 'auto');
-        this.ladder = mode === 'direct' ? LADDER_DIRECT :
-          (mode === 'obfuscated' ? LADDER_OBFUSCATED : LADDER);
+        this.ladder = this.protocolLadder(mode);
       } catch (e) {
-        this.ladder = LADDER;
+        this.ladder = TRANSPORTS;
       }
-      native.logLine(`ladder (${this.ladder.length} transports): ${this.ladder.join(', ')}`);
+      native.logLine(`ladder (${this.ladder.length} transports): ` +
+        `${this.ladder.map((entry: TransportDescriptor) => entry.id).join(', ')}`);
       this.phase = 'connecting';
       native.logLine('result: connecting');
       this.publish();
@@ -307,6 +331,28 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       native.logLine(`result: failed · setup rejected (${message})`);
       this.publish(message);
     }
+  }
+
+  /**
+   * Per-transport settings the native core needs as JSON: the QUIC token and SNI, an
+   * LWO version, a udp2tcp port. Empty when the transport has nothing to say.
+   */
+  private transportSettings(entry: TransportDescriptor, candidate: RelayCandidate): string {
+    return '';
+  }
+
+  /**
+   * The transports that apply to the protocol preference, in table order. Automatic keeps
+   * all of them; the other modes keep one column of the table.
+   */
+  private protocolLadder(mode: string): TransportDescriptor[] {
+    if (mode === 'direct') {
+      return TRANSPORTS.filter((entry: TransportDescriptor) => !entry.obfuscated);
+    }
+    if (mode === 'obfuscated') {
+      return TRANSPORTS.filter((entry: TransportDescriptor) => entry.obfuscated);
+    }
+    return TRANSPORTS;
   }
 
   /**
@@ -327,11 +373,12 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       // before we spend attempts on transports that cannot possibly work.
       const count: number = this.candidates.length;
       const candidate: RelayCandidate = this.candidates[this.candidateIndex % count];
-      const entry: string = this.ladder[Math.floor(this.candidateIndex / count) % this.ladder.length];
+      const entry: TransportDescriptor =
+        this.ladder[Math.floor(this.candidateIndex / count) % this.ladder.length];
       this.candidateIndex += 1;
 
-      const wantsV6: boolean = entry.endsWith('-v6');
-      const obfuscated: boolean = entry.startsWith('shadowsocks');
+      const wantsV6: boolean = entry.family === 'v6';
+      const obfuscated: boolean = entry.obfuscated;
       const ipv6: string = candidate.ipv6 !== undefined && candidate.ipv6 !== null ?
         candidate.ipv6 : '';
       if (wantsV6 && ipv6.length === 0) {
@@ -373,7 +420,8 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
 
       const wireguardPort: number = obfuscated ? SS_INNER_PORT : port;
       const started = JSON.parse(native.tunnelStart(this.tunnelFd, TUN_MTU, candidate.publicKey,
-        endpointIp, wireguardPort, bridge)) as Record<string, Object>;
+        endpointIp, wireguardPort, bridge, entry.kind, this.transportSettings(entry, candidate))) as
+        Record<string, Object>;
       hilog.info(DOMAIN, TAG, 'attempt %{public}s %{public}s', candidate.hostname,
         JSON.stringify(started));
       native.logLine(`attempt ${this.candidateIndex}: ${candidate.hostname} ` +

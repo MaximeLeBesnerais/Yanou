@@ -28,7 +28,8 @@ extern int32_t mh_api_remove_device(const char* token, const char* id, char* out
 extern int32_t mh_api_account(const char* token, char* out, int32_t capacity);
 extern int32_t mh_api_relays(char* out, int32_t capacity);
 extern int32_t mh_tunnel_start(int32_t fd, int32_t mtu, const char* peer_key, const char* endpoint_ip,
-    int32_t endpoint_port, const char* bridge, char* out, int32_t capacity);
+    int32_t endpoint_port, const char* bridge, const char* transport, const char* settings,
+    char* out, int32_t capacity);
 extern int32_t mh_tunnel_status(char* out, int32_t capacity);
 extern void mh_tunnel_stop(void);
 extern void mh_set_diagnostics(int32_t enabled);
@@ -274,8 +275,8 @@ static napi_value WrapSetIpVersion(napi_env env, napi_callback_info info)
 
 static napi_value WrapTunnelStart(napi_env env, napi_callback_info info)
 {
-    size_t argc = 6;
-    napi_value argv[6] = { 0 };
+    size_t argc = 8;
+    napi_value argv[8] = { 0 };
     napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
 
     int32_t fd = -1;
@@ -284,6 +285,8 @@ static napi_value WrapTunnelStart(napi_env env, napi_callback_info info)
     char peer_key[128] = { 0 };
     char endpoint[128] = { 0 };
     char bridge[128] = { 0 };
+    char transport[32] = { 0 };
+    char settings[512] = { 0 };
     size_t length = 0;
     if (argc >= 1) {
         napi_get_value_int32(env, argv[0], &fd);
@@ -303,10 +306,16 @@ static napi_value WrapTunnelStart(napi_env env, napi_callback_info info)
     if (argc >= 6) {
         napi_get_value_string_utf8(env, argv[5], bridge, sizeof(bridge), &length);
     }
+    if (argc >= 7) {
+        napi_get_value_string_utf8(env, argv[6], transport, sizeof(transport), &length);
+    }
+    if (argc >= 8) {
+        napi_get_value_string_utf8(env, argv[7], settings, sizeof(settings), &length);
+    }
 
     char buffer[512] = { 0 };
-    int32_t written = mh_tunnel_start(fd, mtu, peer_key, endpoint, port, bridge, buffer,
-        (int32_t)sizeof(buffer));
+    int32_t written = mh_tunnel_start(fd, mtu, peer_key, endpoint, port, bridge, transport, settings,
+        buffer, (int32_t)sizeof(buffer));
     napi_value result;
     napi_create_string_utf8(env, buffer, written > 0 ? (size_t)written : 0, &result);
     return result;

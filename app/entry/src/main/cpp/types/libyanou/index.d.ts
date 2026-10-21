@@ -86,7 +86,7 @@ export const openRelaySocket: (family: number) => number;
  * native process. Answers `{"ok":true,"endpoint":"ip:port"}` or an error object.
  */
 export const tunnelStart: (fd: number, mtu: number, peerKey: string, endpointIp: string,
-  endpointPort: number, bridgeEndpoint: string) => string;
+  endpointPort: number, bridgeEndpoint: string, transport: string, settings: string) => string;
 
 /** `{"running":bool,"inbound":bool,"error":""}` — `inbound` is the handshake proof. */
 export const tunnelStatus: () => string;

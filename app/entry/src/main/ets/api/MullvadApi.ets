@@ -33,6 +33,16 @@ export interface WireGuardKey {
   publicKey: string;
 }
 
+/** Parameters for the MASQUE proxy a relay publishes under `features.quic`. */
+export interface RelayQuic {
+  /** In-addresses of the proxy (the relay's own addresses are included only if listed). */
+  addr: string[];
+  /** Authorization token for the CONNECT request. */
+  token: string;
+  /** Hostname the proxy's TLS certificate is issued for: the SNI. */
+  domain: string;
+}
+
 /** One relay, flattened by the native side so the UI never walks the raw list. */
 export interface RelayItem {
   hostname: string;
@@ -48,6 +58,12 @@ export interface RelayItem {
   active: boolean;
   owned: boolean;
   daita: boolean;
+  /** LWO v1 capability advertised by the relay. Optional: old caches lack the field. */
+  lwo?: boolean;
+  /** LWO v2 capability advertised by the relay. Optional: old caches lack the field. */
+  lwoV2?: boolean;
+  /** QUIC/MASQUE proxy details; absent when the relay publishes none. */
+  quic?: RelayQuic;
 }
 
 export interface RelaySelection {

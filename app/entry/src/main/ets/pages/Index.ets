@@ -1242,6 +1242,17 @@ struct Index {
         'publicKey': relay.publicKey,
         'ssExtra': relay.ssExtra !== undefined && relay.ssExtra !== null ? relay.ssExtra : []
       };
+      // Optional capabilities travel with the relay so the extension can pick a
+      // transport. A relay list cached by an older build has neither field.
+      if (relay.lwo !== undefined && relay.lwo !== null) {
+        entry['lwo'] = relay.lwo;
+      }
+      if (relay.lwoV2 !== undefined && relay.lwoV2 !== null) {
+        entry['lwoV2'] = relay.lwoV2;
+      }
+      if (relay.quic !== undefined && relay.quic !== null) {
+        entry['quic'] = relay.quic;
+      }
       candidates.push(entry);
     }
     return candidates;

@@ -567,6 +567,23 @@ fn summarize_relays(list: &Value) -> Value {
                         .collect()
                 })
                 .unwrap_or_default();
+            // The API writes a feature key only on relays that implement it (`"lwo": {}`),
+            // so presence is the capability flag. `lwo_v2` is superset of `lwo`.
+            let quic = relay
+                .pointer("/features/quic")
+                .map(|quic| {
+                    let addr: Vec<Value> = quic
+                        .get("addr_in")
+                        .and_then(Value::as_array)
+                        .map(|items| items.iter().filter(|item| item.is_string()).cloned().collect())
+                        .unwrap_or_default();
+                    json!({
+                        "addr": addr,
+                        "token": quic.get("token").cloned().unwrap_or(Value::Null),
+                        "domain": quic.get("domain").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .unwrap_or(Value::Null);
             relays.push(json!({
                 "hostname": relay.get("hostname").cloned().unwrap_or(Value::Null),
                 "ssExtra": ss_extra,
@@ -582,6 +599,9 @@ fn summarize_relays(list: &Value) -> Value {
                 "daita": relay.pointer("/features/daita").cloned()
                     .or_else(|| relay.get("daita").cloned())
                     .unwrap_or(Value::Bool(false)),
+                "lwo": relay.pointer("/features/lwo").is_some(),
+                "lwoV2": relay.pointer("/features/lwo_v2").is_some(),
+                "quic": quic,
             }));
         }
     }

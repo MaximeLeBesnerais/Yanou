@@ -21,7 +21,7 @@ use gotatun::tun::{IpRecv, IpSend, MtuWatcher};
 use serde_json::json;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::obfs::TransportFactory;
+use crate::transports::TransportFactory;
 use crate::{api::runtime, log_line, note_started, write_out};
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -155,6 +155,8 @@ pub extern "C" fn mh_tunnel_start(
     endpoint_ip: *const c_char,
     endpoint_port: c_int,
     bridge: *const c_char,
+    transport: *const c_char,
+    settings: *const c_char,
     out: *mut c_char,
     capacity: c_int,
 ) -> c_int {
@@ -214,10 +216,17 @@ pub extern "C" fn mh_tunnel_start(
         }
     });
 
+    // The transport is chosen by the extension: the ladder knows which one this attempt
+    // is, and the engine only needs its name. Unknown names fail loudly here.
+    let transport_name = cstr(transport).unwrap_or_else(|| "direct".to_string());
+    // Per-transport settings the extension knows and the core does not: the QUIC token
+    // and SNI, an LWO version, a udp2tcp port. Empty string when the transport has none.
+    let transport_settings = cstr(settings).unwrap_or_default();
+
     HANDSHAKE.store(false, Ordering::SeqCst);
     RX_BYTES.store(0, Ordering::SeqCst);
     TX_BYTES.store(0, Ordering::SeqCst);
-    crate::obfs::reset_counters();
+    crate::transports::reset_counters();
     if let Ok(mut guard) = LAST_ERROR.lock() {
         guard.clear();
     }
@@ -248,7 +257,7 @@ pub extern "C" fn mh_tunnel_start(
 
         let udp_socket = tokio::net::UdpSocket::from_std(std_socket)
             .map_err(|error| format!("relay socket: {error}"))?;
-        let transport = TransportFactory::new(udp_socket, endpoint, bridge)?;
+        let transport = TransportFactory::new(udp_socket, endpoint, bridge, &transport_name, &transport_settings)?;
 
         let mut config = tun::Configuration::default();
         config.raw_fd(fd).mtu(mtu as u16).close_fd_on_drop(false);
@@ -413,8 +422,8 @@ pub extern "C" fn mh_tunnel_status(out: *mut c_char, capacity: c_int) -> c_int {
     let payload = json!({
         "running": RUNNING.load(Ordering::SeqCst),
         "handshake": HANDSHAKE.load(Ordering::SeqCst),
-        "udpSent": crate::obfs::counters().0,
-        "udpRecv": crate::obfs::counters().1,
+        "udpSent": crate::transports::counters().0,
+        "udpRecv": crate::transports::counters().1,
         "inbound": HANDSHAKE.load(Ordering::SeqCst),
         "rxBytes": RX_BYTES.load(Ordering::Relaxed),
         "txBytes": TX_BYTES.load(Ordering::Relaxed),
