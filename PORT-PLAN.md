@@ -336,138 +336,164 @@ starting M1.
    Connect/Disconnect notification into one card, or only group them? Two VPN notifications is a
    product decision that depends on this answer.
 
-## 7. Feature plans
+## 7. Work units
 
-Features the upstream client has and this one does not, with the path to each. They are
-ordered by cost, not by value: the DNS pair is UI work, the transports are self-contained
-Rust, multihop reworks how devices are chained, and DAITA pulls in a gRPC service and a
-userspace network stack.
+The features are grouped into **work units** rather than listed one per feature. A unit is a
+set of changes one person can carry without editing files another unit is editing, so two
+units can run at the same time. Each unit has an exit criterion that can be checked on the
+device.
 
 Sizes are relative (S, M, L, XL), not durations, per the rule at the top of this file.
 
-| Feature | Value | Size | Main risk |
-|---|---|---|---|
-| Custom DNS | works on every network | S | none |
-| DNS content blocking | works on every network | S | none |
-| LWO | reaches relays on filtered networks | M | framing must match the relay byte for byte |
-| udp2tcp | works where UDP is blocked | M | depends on a fork of `udp-over-tcp` |
-| Multihop | harder correlation, exit country | L | rework of the device chain, MTU |
-| QUIC/MASQUE | works where UDP is blocked | L | the MASQUE client is not a published crate |
-| DAITA | traffic-analysis defence | XL | gRPC config service plus a userspace stack |
-| Per-app split tunnelling | privacy | out of scope | requires a system permission |
+| Unit | Contains | Depends on | Parallel with | Size |
+|---|---|---|---|---|
+| **U0 Contract** | relay fields, transport trait, data-driven ladder | none | U1, U4 | S |
+| **U1 DNS** | custom DNS, content blocking | none | U0, U4 | S |
+| **U2 LWO** | LWO v1/v2 transport | U0 | U3, U4, U5 | M |
+| **U3 udp2tcp** | TCP-framed transport | U0 | U2, U4, U5 | M |
+| **U4 Multihop** | two-device chain, exit selection | none | U0, U1, U2, U3, U5 | L |
+| **U5 QUIC** | MASQUE transport | U0 | U2, U3, U4 | L |
+| **U6 DAITA** | config service, maybenot, netstack | U4 | none | XL |
 
-Shared groundwork, needed by most of the transport items:
+```
+U0 contract ──┬──> U2 LWO ──────┐
+              ├──> U3 udp2tcp ──┤   all three in separate files
+              └──> U5 QUIC ─────┘
 
-- The relay model carries six fields today: hostname, IPv4, IPv6, public key, DAITA flag,
-  Shadowsocks addresses. QUIC needs `features.quic` (`addr_in`, `token`, `domain`), udp2tcp
-  needs `wireguard.udp2tcp_ports`, LWO needs `features.lwo` and `features.lwo_v2`. They are
-  read in `api.rs`, added to `RelayCandidate`, and passed to the extension in the `Want`.
-- Every transport carries an MTU overhead. The ladder already accounts for Shadowsocks; each
-  new entry has to report its overhead the same way, or the tunnel black-holes large packets.
-- The ladder in `VpnExtensionAbility.ets` is an array of strings. Each transport adds an entry
-  and a branch in `startCandidate()`.
+U1 DNS ─────── independent, any time
+U4 Multihop ── independent, owns tunnel.rs and the UI
+U6 DAITA ───── after U4, shares the peer and ingress model
+```
 
-### 7.1 Custom DNS  (S)
+**File ownership**, so parallel units do not collide:
 
-The user supplies one or more resolvers instead of `10.64.0.1`.
+| File | Owner |
+|---|---|
+| `api.rs`, `MullvadApi.ets` (relay model) | U0, then read-only |
+| `obfs.rs` → `transports/` | U0 splits it; U2, U3, U5 own one file each afterwards |
+| `VpnExtensionAbility.ets` | U0 (ladder), U1 (DNS), U4 (`Want`) — separate functions, merge last |
+| `tunnel.rs` | U4, then U6 |
+| `Index.ets` (settings page) | U1 |
+| `Index.ets` (main page, server selection) | U4 |
+| `VpnSettings.ets` | U1 |
 
-Upstream: `mullvad-daemon/src/dns.rs` (`DnsState::Custom`), `talpid-dns`.
+### U0 — Transport contract  (S)
 
-Needed here: an address list in settings, validation, and `VpnConfig.dnsAddresses` built from
-it in the extension. Public resolvers are reached through the tunnel by the default route;
-private ones should not be, which is the same split upstream makes with `is_local_address`,
-and it means adding a route exclusion for RFC1918 in `setup()`.
+Nothing in it is a feature; it is what lets U2, U3 and U5 be written at the same time.
 
-Risk: low. The only subtle part is the split between tunnelled and non-tunnelled resolvers.
+- **Relay model.** The four fields we keep today (hostname, IPv4, IPv6, public key) grow to
+  carry `features.quic` (`addr_in`, `token`, `domain`), `features.lwo`/`lwo_v2` and
+  `wireguard.udp2tcp_ports`. Read in `api.rs`, added to `RelayCandidate`, passed to the
+  extension in the `Want`.
+- **Transport trait.** `obfs.rs` becomes `transports/mod.rs` plus one file per transport, with
+  a small trait: create from (relay, socket, settings), report MTU overhead, send, recv.
+  Shadowsocks is the worked example.
+- **Ladder.** Data-driven: each transport reports whether it applies to this relay and what
+  its overhead is, instead of the string array and the branch in `startCandidate()`.
 
-### 7.2 DNS content blocking  (S)
+Exit criterion: a stub transport can be added by creating one file and one relay field,
+without editing the ladder logic in `VpnExtensionAbility.ets`.
 
-Mullvad's resolver blocks ads, trackers, malware, adult content, gambling and social media,
-and the selection encoded in the resolver address rather than in a config file.
+Risk: low. It is a refactor of working code, and the transport trait is already implicit in
+what Shadowsocks does.
 
-Upstream: `mullvad-daemon/src/dns.rs`. The address is `100.64.0.0` with a bitmask in the last
-octet: ads 1, trackers 2, malware 4, adult 8, gambling 16, social 32. Blocking ads only gives
-`100.64.0.1`; ads plus trackers gives `100.64.0.3`.
+### U1 — DNS  (S)
 
-Needed here: six switches in settings, the mask persisted in `VpnPrefs`, and the computed
-address used as the only DNS server. No Rust change.
+Two settings, one unit, no Rust work.
 
-Risk: none, but verify the resolver answers inside the tunnel before wiring the UI.
+**Custom DNS.** The user supplies resolvers instead of `10.64.0.1`
+(`mullvad-daemon/src/dns.rs`, `DnsState::Custom`). They go into
+`VpnConfig.dnsAddresses`; public ones are reached through the tunnel by the default route,
+private ones should not be, which is the split upstream makes with `is_local_address` and
+means adding RFC1918 route exclusions in `setup()`.
 
-### 7.3 LWO  (M)
+**Content blocking.** The resolver *is* the configuration: `100.64.0.0` with a bitmask in the
+last octet, ads 1, trackers 2, malware 4, adult 8, gambling 16, social 32. Ads alone gives
+`100.64.0.1`; ads and trackers gives `100.64.0.3`.
 
-WireGuard packets are padded and obfuscated so they no longer look like WireGuard, without a
-TCP tunnel. Two protocol versions exist; v2 adds timer parameters on the gotatun peer.
+Exit criterion: `dig` through the tunnel returns the blocked answer for a known ad domain,
+and a custom resolver answers when configured.
 
-Upstream: `tunnel-obfuscation/src/lwo/mod.rs` and `v2.rs`, `talpid-wireguard/src/gotatun/mod.rs`
-(`lwo_version`, `lwo_timer_params`), relay flags `features.lwo` and `features.lwo_v2`.
+Risk: none. Verify the resolver answers inside the tunnel before building the UI around it.
 
-Needed here: a transport in `obfs.rs` beside the Shadowsocks one, keys derived from the client
-and server public keys, per-version framing and padding, `Peer::dangerously_with_timer_params`
-for v2, relay fields, and a ladder entry between direct and Shadowsocks.
+### U2 — LWO  (M)
 
-Risk: the framing has to match the relay exactly. It is testable on a device in one session,
-and there is no new dependency.
+WireGuard packets padded and obfuscated so they do not look like WireGuard, without a TCP
+tunnel. Two versions; v2 adds timer parameters on the gotatun peer.
 
-### 7.4 udp2tcp  (M)
+Upstream: `tunnel-obfuscation/src/lwo/mod.rs`, `v2.rs`, and `lwo_version`/`lwo_timer_params` in
+`talpid-wireguard/src/gotatun/mod.rs`.
 
-WireGuard datagrams are length-prefixed into a TCP stream to a port on the relay, for
-networks that pass TCP but drop UDP.
+Work: keys derived from both public keys, per-version framing and padding, and
+`Peer::dangerously_with_timer_params` for v2. No new dependency.
 
-Upstream: `tunnel-obfuscation/src/udp2tcp.rs`, the `udp-over-tcp` crate (a Mullvad fork, pinned
-by git revision), relay field `wireguard.udp2tcp_ports`.
+Exit criterion: a handshake completes through LWO against a relay that advertises `lwo_v2`.
 
-Needed here: a TCP socket, `protect()` on its descriptor (the call is descriptor-based, so it
-works for TCP the same way it does for the UDP socket), the framing from the crate, a ladder
-entry, and the port list in the relay model.
+Risk: the framing must match the relay exactly; one device session proves it either way.
 
-Risk: the dependency is a git fork; it has to be pinned and vendored or the build is not
-reproducible. Otherwise the transport is small.
+### U3 — udp2tcp  (M)
 
-### 7.5 Multihop  (L)
+Datagrams length-prefixed into a TCP stream to a port on the relay, for networks that pass TCP
+and drop UDP.
 
-Traffic goes entry relay then exit relay, so no single relay sees both the client address and
-the destination.
+Upstream: `tunnel-obfuscation/src/udp2tcp.rs`, the `udp-over-tcp` fork pinned by git revision,
+relay field `wireguard.udp2tcp_ports`.
 
-Upstream: `talpid-wireguard/src/gotatun/mod.rs` (`Multihop`, `EntryDevice`, `ExitDevice`,
-`TunChannelTx`/`TunChannelRx`), `mullvad-relay-selector` for the entry and exit choices.
+Work: a TCP socket, `protect()` on its descriptor (the call is descriptor-based, so it works
+for TCP), the framing from the crate.
 
-Needed here: two gotatun devices. The entry device has the real tun on one side and a packet
-channel on the other; the exit device reads that channel and its peer is the exit relay. The
-MTU drops by a second WireGuard header (upstream floors it at 1280). The UI needs a separate
-exit selection, and the relay selector has to keep entry and exit distinct, which the current
-single `selection` does not model.
+Exit criterion: a handshake completes over TCP to a relay that publishes udp2tcp ports.
 
-Risk: the device chaining is the largest structural change in the native core; MTU mistakes
-look like a working tunnel that stalls on large packets.
+Risk: the dependency is a git fork; pin and vendor it or the build stops being reproducible.
 
-### 7.6 QUIC/MASQUE  (L)
+### U4 — Multihop  (L)
 
-WireGuard datagrams are carried as MASQUE CONNECT-UDP datagrams inside QUIC to a proxy on the
-relay, on UDP 443.
+Traffic goes entry relay then exit relay, so no single relay sees both the client and the
+destination.
 
-Upstream: `tunnel-obfuscation/src/quic.rs` and the `mullvad-masque-proxy` crate, relay field
-`features.quic` with `addr_in`, `token` and `domain`. The TLS SNI is the published domain, the
+Upstream: `Multihop`, `EntryDevice`, `ExitDevice`, `TunChannelTx`/`TunChannelRx` in
+`talpid-wireguard/src/gotatun/mod.rs`; entry and exit selection in `mullvad-relay-selector`.
+
+Work: two gotatun devices. The entry device has the tun on one side and a packet channel on the
+other; the exit device reads that channel with the exit relay as its peer. MTU drops by a
+second WireGuard header, floored at 1280. The UI needs a separate exit choice, and the current
+single `selection` has to become an entry/exit pair.
+
+Exit criterion: traffic exits through the chosen exit relay's country, and a speed test does
+not stall on large packets.
+
+Risk: the largest structural change in the native core. MTU mistakes look like a healthy
+tunnel that stalls on large packets.
+
+### U5 — QUIC/MASQUE  (L)
+
+WireGuard datagrams carried as MASQUE CONNECT-UDP datagrams inside QUIC to a proxy on the
+relay, UDP 443.
+
+Upstream: `tunnel-obfuscation/src/quic.rs`, the `mullvad-masque-proxy` crate, relay field
+`features.quic` with `addr_in`, `token`, `domain`. The TLS SNI is the published domain; the
 token goes in the CONNECT request.
 
-Needed here: a QUIC stack and a MASQUE client. `mullvad-masque-proxy` is a workspace crate in
-the upstream repository, not on crates.io, so the choice is to vendor it (it is GPL-3.0 like
-the rest) or write the CONNECT-UDP client against `quinn`. Then relay fields and a ladder
-entry.
+Work: a QUIC stack plus a MASQUE client. The crate is a workspace member in the upstream
+repository and is not published, so either vendor it (GPL-3.0, same as the rest) or write the
+CONNECT-UDP client against `quinn`.
 
-Risk: the largest new dependency footprint after DAITA, and it only pays off on networks that
-block UDP but allow QUIC on 443.
+Exit criterion: a handshake completes through the proxy on a network that drops plain UDP.
 
-### 7.7 DAITA  (XL)
+Risk: the second-largest dependency footprint, and it only pays off on networks that allow
+QUIC on 443.
 
-Defence against traffic analysis: constant packet sizes, decoy traffic and pacing, driven by
-machines handed out by the relay's config service.
+### U6 — DAITA  (XL)
+
+Constant packet sizes, decoy traffic and pacing against traffic analysis, driven by machines
+handed out by the relay's config service.
 
 Upstream: `talpid-tunnel-config-client` (gRPC to the config service on port 1337 of the ingress
-relay), the `maybenot` crate, `talpid-wireguard` (DAITA settings applied to the peer), and the
-`daita` feature of gotatun, which this client already has available in its pinned version.
+relay), the `maybenot` crate, `talpid-wireguard` applying the settings to the peer. The pinned
+gotatun already carries the `daita` feature, so the packet-shaping half needs a flag and
+settings, not new code.
 
-Needed here, in order:
+Work, in order:
 
 1. A gRPC client and the protobuf definitions from `talpid-tunnel-config-client`.
 2. A way to reach the config service before the tunnel exists. Upstream builds a temporary
@@ -475,31 +501,34 @@ Needed here, in order:
    to `10.64.0.1:1337` through it. That stack is the expensive part.
 3. Apply the returned PSK and machines to the real device: `Peer::with_daita`, decoy and delay
    fractions, timer parameters.
-4. The relay filter, which already exists in the settings.
+4. The relay filter, which already exists.
 
-The same negotiation also returns the post-quantum PSK, so a DAITA implementation buys the
-quantum-resistant session for free.
+The same negotiation returns the post-quantum PSK, so this unit also delivers the
+quantum-resistant session.
 
-Risk: two large dependencies (tonic/prost and a userspace network stack) for a feature whose
-effect is invisible when it works. The wire protocol is the most likely of the group to change
-between upstream releases.
+Exit criterion: the relay reports DAITA machines for the session and the peer applies them
+(visible in the diagnostics log), with traffic still flowing.
 
-### 7.8 Per-app split tunnelling  (not feasible)
+Risk: two large dependencies (tonic/prost, a userspace network stack) for a feature whose
+effect is invisible when it works, on the protocol most likely to change upstream.
+
+### Out of scope — per-app split tunnelling
 
 `VpnConfig.trustedApplications` and `blockedApplications` accept bundle names, but listing the
 installed applications needs `ohos.permission.GET_BUNDLE_INFO_PRIVILEGED` (system_basic) or
 `ENTERPRISE_GET_INSTALLED_BUNDLE_LIST` (enterprise). A normal application can resolve a bundle
-name it already knows; it cannot enumerate them. That makes an application picker impossible
-and leaves hand-typed bundle names, which is not a feature. Recorded so it is not
-re-investigated.
+name it knows; it cannot enumerate them. An application picker cannot exist, and hand-typed
+bundle names are not a feature. Recorded so it is not re-investigated.
 
-### 7.9 Order
+### Sequencing
 
-7.1 and 7.2 first: UI work, no protocol, immediate value on every network. 7.3 next: one
-session to implement, one session to validate against a relay. 7.4 after it, for the same
-reason with one more dependency. 7.5 is the structural change that 7.6 and 7.7 will reuse, so
-it comes before them even though it is not the most-requested feature. 7.6 before 7.7 because
-QUIC is a transport and DAITA is a protocol stack with a control plane.
+**Two or three people, three waves.** Wave 1: U0, U1, U4 — U1 is pure UI, U0 and U4 touch
+disjoint files. Wave 2: U2, U3, U5 — all three start the moment U0 lands, each in its own file.
+Wave 3: U6 alone, after U4, because both change the peer and ingress model.
+
+**One person.** U1, U0, U2, U3, U5, U4, U6. That order ships something visible in the first
+unit, keeps the transport work together, and leaves the two structural units for when the
+ladder is comfortable.
 
 ## 8. UI backlog
 
