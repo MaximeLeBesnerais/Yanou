@@ -536,64 +536,47 @@ Wave 3: U6 alone, after U4, because both change the peer and ingress model.
 unit, keeps the transport work together, and leaves the two structural units for when the
 ladder is comfortable.
 
-## 8. UI backlog
+## 8. UI/UX pass
 
-**Next goal after the feature work: a UI/UX pass.** The settings screen has outgrown itself —
-DNS moved to its own screen, but protocol preference, kill switch, IP version, direct
-connection, diagnostics, DAITA and multihop still stack into one long scroll. The main screen
-also scrolls, which it should not for a four-element page. Nothing has been checked at phone
-width: the layout was built on a 2800 px tablet. The pass is: one sub-screen per concern
-(Network, DNS, Privacy, Relay), a main screen that fits without scrolling at tablet height,
-and a small-window run (DevEco's small-screen preview or a phone-sized emulator window) to
-check every screen at 360–420 dp before calling it done.
+Shipped. The settings screen is an index of one row per decision, and anything that needs
+more than a switch has its own destination:
 
+| Screen | Contains |
+| --- | --- |
+| Main | status card (power, state, rx/tx, handshake, details link), relay row, Reconnect/Connect |
+| Connection details (sheet) | every value the extension publishes, plus device address, MTU, DNS, kill switch, protector fd |
+| Settings | Connection (servers, exit, protocol, IP version, multihop, kill switch), DNS (resolver, content blocking), Privacy (DAITA, direct connection), App (diagnostics, about, account) |
+| Connection | protocol and device IP version, with the hint for each |
+| DNS | automatic or custom resolver, custom list editor |
+| Content blocking | the six categories, disabled and explained when DNS is custom |
+| Servers / Exit relay | search, filter chips, favourites, recent, countries with cities |
+| Diagnostics / Attempt | toggle, keys and target, filter chips over every status, per-attempt body, zip and raw export |
+| Account | account number, expiry, this device, device list with Manage, sign out |
+| About | client-not-service text, version, licence, source |
 
-Ordered by what the user feels first, not by what is easiest. Each item is sized in
-"one visible increment" terms.
+The main screen fits a 360x640 dp window without scrolling. 360 dp was checked on the tablet
+by rendering the whole app in a 360x640 frame (a temporary constant, removed again), then
+the same screens were checked full size.
 
-### 8.1 Connection confidence (highest value)
-- **Connection details sheet**: tapping the hero card opens transport (direct/Shadowsocks),
-  relay hostname, IPv6/IPv4, handshake latency, uptime, rx/tx, and a link to that attempt's
-  diagnostics entry. Everything needed already exists in `VpnStatePayload`; only the UI is missing.
-- **In-progress detail**: while connecting, show `attempt 3 · sg-sin-wg-001 · ipv6 direct`
-  instead of a static "Trying …".
-- **Persistent "connection lost" banner** in the header (not just inside the card), with the
-  retry countdown while the ladder works.
-- **Latency-aware Automatic**: measure handshake time per candidate (it is already logged) and
-  prefer the fastest country; surface it as "automatic · 120 ms".
+The pass also fixed things the UI was hiding:
 
-### 8.2 Server browser
-- Replace the inline-expanding country rows with a real drill-down: country → city → relay,
-  with the current relay pinned at the top and marked.
-- Filter chips: DAITA, owned, recent, and (later) providers.
-- Favourites and a user-ordered custom list, stored like `recents`.
-- Search across country/city/hostname with result grouping, and keep the query when navigating
-  back.
-- Usage map shown per country as a small sparkline rather than "used 8×".
+- A browser search string narrowed the relays the tunnel actually tried (`filteredRelays`
+  fed `candidatesForSelection`). Candidate selection now reads the full relay list.
+- The tunnel log was never bounded; it reached 300 MB and `readTextSync` aborted the app
+  when Diagnostics was opened. The UI now reads the last 512 KiB, the core rotates the file
+  at 8 MiB.
+- Export and "Check DNS" wrote their result into a string no view rendered, so the buttons
+  looked dead. Both now toast their outcome.
+- Sign-out left the previous account's expiry and device list in state; the account device
+  list offered Remove on the device the tunnel was using; export leaked file descriptors.
+- Dead code removed: `countries`, `loadRelays`, `matchingCountries`, `recentRelays`,
+  `accountBusy`, two unused `DiagLog` exports. Rows, cards, chips and dividers now come from
+  `common/Ui.ets` instead of nine hand-written copies.
 
-### 8.3 Settings that do what they say
-- **Kill switch**: sets `isBlocking` while the tunnel is up. Verify on device that blocking holds
-  while the tunnel is down, and add route policy if it does not.
-- **MTU**: expose it (1280/1360/1420), since container and mobile networks differ.
-- **Per-app routing**: exclude chosen bundles from the tunnel, the only way to make
-  Android-in-a-box containers usable with this client.
-- **DNS content blocking**: the resolver bitmask (ads/trackers/malware/adult/gambling/social)
-  needs the backend first; UI after.
+Still open:
 
-### 8.4 Account and devices
-- Move "Manage devices" into the Account screen (it is only reachable from the login screen today).
-- Expiry warning banner when the account is within 7 days of expiring.
-- Show the device key fingerprint and let the user copy it (useful when debugging registration).
-
-### 8.5 Diagnostics
-- Filter chips (all / failed / connected), newest first, plus "share this entry".
-- Live tail while connected, so a drop is visible without leaving the screen.
-
-### 8.6 Platform polish
-- Two-pane layout on wide screens (server list | selected server + connect), instead of a
-  single 720 px column on a 2800 px tablet.
-- App icon and label pass; accessibility labels on every `SymbolGlyph` button (they are
-  unlabelled for screen readers today).
-- Empty/loading/error states for every list.
-- **About / licences screen**: GPL-3.0 source offer, third-party notices, version and build.
-  Required before distributing a binary.
+- Two-pane layout on wide screens (server list beside the status card) instead of one
+  720 vp column on a tablet.
+- Accessibility labels on the `SymbolGlyph`-only buttons.
+- MTU control and per-app routing, which need core support first.
+- Diagnostics, Account and About have not been re-checked at 360 dp, only at tablet width.

@@ -32,15 +32,19 @@ Tested on a Huawei MatePad (TGR-W00), HarmonyOS 6.1, SDK API 26, `compatibleSdkV
   <img src="docs/screens/connected.jpeg" width="49%" alt="Connected to a Mullvad relay">
 </p>
 
-Sign-in takes an account number you already hold and nothing else. Once connected, the home
-screen shows the relay, the handshake time, the counters and the device IP version the
-tunnel is running with.
+Sign-in takes an account number you already hold and nothing else. The home screen is one
+card: state, the counters, the handshake time, and a details sheet with everything the
+tunnel published. The relay row underneath opens the browser; with multihop on, an exit row
+appears below it.
 
 <p align="center">
-  <img src="docs/screens/about.jpeg" width="70%" alt="About screen with the disclosure text">
+  <img src="docs/screens/settings.jpeg" width="49%" alt="Settings index: connection, DNS, privacy, app">
+  <img src="docs/screens/about.jpeg" width="49%" alt="About screen with the disclosure text">
 </p>
 
-The About screen repeats the disclosure in the app: a client, not a service, not affiliated
+Settings is an index, not a wall of switches: connection, DNS, privacy and app each hold
+one row per decision, and the rows that need more than a toggle open their own screen. The
+About screen repeats the disclosure in the app: a client, not a service, not affiliated
 with Mullvad, and a warning that anyone selling a subscription through a third party is a
 scam.
 

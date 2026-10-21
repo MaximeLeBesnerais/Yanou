@@ -215,15 +215,6 @@ export function parseDiagLog(raw: string): DiagEntry[] {
   return entries.reverse();
 }
 
-/** Colour role for an entry's status, resolved by the caller. */
-export function statusIsFailure(entry: DiagEntry): boolean {
-  return entry.status === 'failed';
-}
-
-export function statusIsSuccess(entry: DiagEntry): boolean {
-  return entry.status === 'connected';
-}
-
 /** Totals per status, for the filter chips above the diagnostics list. */
 export interface DiagStatusCounts {
   connected: number;

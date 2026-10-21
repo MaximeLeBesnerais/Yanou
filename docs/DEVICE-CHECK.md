@@ -20,7 +20,8 @@ Connect with the default settings (IPv4 only, kill switch on, automatic protocol
 
 ## 2. Content blocking
 
-Settings → DNS → switch on **Ads**, connect, then tap **Check DNS** in Diagnostics.
+Settings → DNS → **Content blocking** → switch on **Ads**, connect, then tap **Check DNS**
+in Diagnostics (it toasts how many of the probes were blocked).
 
 - Log: `dns: auto · blocking mask 1 · 100.64.0.1` (what the tunnel advertises) and
   `dns: in-tunnel redirect to 100.64.0.1; only IPv4 DNS is redirected, IPv6 DNS passes
@@ -34,7 +35,8 @@ Settings → DNS → switch on **Ads**, connect, then tap **Check DNS** in Diagn
 
 ## 3. Custom DNS
 
-Settings → DNS → **Custom**, add a public resolver (for example `1.1.1.1`), connect.
+Settings → DNS → **Resolver** → **Custom**, add a public resolver (for example `1.1.1.1`),
+connect.
 
 - Log: `dns: 1.1.1.1` and no exclusion line.
 - Add a private resolver (for example `192.168.1.1`): the log line must say
@@ -42,9 +44,10 @@ Settings → DNS → **Custom**, add a public resolver (for example `1.1.1.1`), 
 
 ## 4. Multihop
 
-Settings → enable **Multihop**, then pick an **Exit relay** from the server browser.
+Settings → **Multihop**, then pick an **Exit relay** from the server browser.
 
-- UI: configuration card shows `MTU 1360` and `Multihop · exit <city>`.
+- UI: the connection details sheet (tap the status card) shows `MTU 1360`, `Exit <city>`, and
+  a DNS resolver of the form `100.64.0.<mask>` when blocking is on.
 - Log: `tunnel: multihop mtu 1360 (1420 - 60 B second WireGuard header, floor 1280)`,
   then `tunnel: multihop handshake confirmed on both devices`.
 - A large transfer (a file download) must not stall.
@@ -103,7 +106,7 @@ now treats such a cache as stale.
 
 ## 5. DAITA
 
-Settings → DAITA on, then connect to a relay that advertises it.
+Settings → Privacy → **DAITA** on, then connect to a relay that advertises it.
 
 - Log, in order: `daita: requested for this connection`, `daita: negotiating via
   10.64.0.1:1337`, `daita: relay returned <N> machine(s)`, `tunnel: daita active with <N>

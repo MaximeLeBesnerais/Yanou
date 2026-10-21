@@ -121,6 +121,35 @@ fn log_line(message: &str) {
     write_line(&format!("{prefix}{message}"));
 }
 
+/// Keep the tunnel log small enough to read on a phone. Diagnostics on a wandering
+/// network logs every packet, and an unbounded file once grew to 300 MB; a single read of
+/// that is more than the UI can turn into a string.
+const LOG_LIMIT: u64 = 8 * 1024 * 1024;
+/// Above this, the old file is dropped rather than kept as `.1`: it is not useful anyway.
+const LOG_KEEP_LIMIT: u64 = 64 * 1024 * 1024;
+/// Checking the size on every line would mean a `stat` per packet.
+const LOG_CHECK_EVERY: u64 = 512;
+static LOG_WRITES: AtomicU64 = AtomicU64::new(0);
+
+fn rotate_log_if_large(path: &str) {
+    rotate_log(path, LOG_LIMIT, LOG_KEEP_LIMIT);
+}
+
+fn rotate_log(path: &str, limit: u64, keep_limit: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= limit {
+        return;
+    }
+    if meta.len() > keep_limit {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    // One previous generation is enough to read what happened just before rotation.
+    let _ = std::fs::rename(path, format!("{path}.1"));
+}
+
 fn write_line(line: &str) {
     let dir = match FILES_DIR.lock() {
         Ok(guard) => guard.clone(),
@@ -130,6 +159,9 @@ fn write_line(line: &str) {
         return;
     }
     let path = format!("{dir}/yanou-native.log");
+    if LOG_WRITES.fetch_add(1, Ordering::Relaxed) % LOG_CHECK_EVERY == 0 {
+        rotate_log_if_large(&path);
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{line}");
     }
@@ -570,4 +602,48 @@ pub extern "C" fn mh_stop() {
         *guard = None;
     }
     log_line("stop requested");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory per test, so two tests cannot rotate each other's file.
+    fn log_in(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("yanou-log-{name}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("yanou-native.log")
+    }
+
+    fn rotated(path: &std::path::Path) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}.1", path.display()))
+    }
+
+    #[test]
+    fn a_small_log_is_left_alone() {
+        let path = log_in("small");
+        std::fs::write(&path, b"one line\n").unwrap();
+        rotate_log(path.to_str().unwrap(), 1024, 4096);
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"one line\n");
+    }
+
+    #[test]
+    fn rotation_keeps_one_previous_generation() {
+        let path = log_in("rotate");
+        std::fs::write(&path, vec![b'x'; 2048]).unwrap();
+        rotate_log(path.to_str().unwrap(), 1024, 4096);
+        assert!(!path.exists(), "the current log is moved aside");
+        assert_eq!(std::fs::metadata(rotated(&path)).unwrap().len(), 2048);
+        let _ = std::fs::remove_file(rotated(&path));
+    }
+
+    #[test]
+    fn an_oversized_previous_log_is_dropped_instead_of_kept() {
+        let path = log_in("drop");
+        std::fs::write(&path, vec![b'x'; 8192]).unwrap();
+        rotate_log(path.to_str().unwrap(), 1024, 4096);
+        assert!(!path.exists());
+        assert!(!rotated(&path).exists(), "nothing keeps 8 KiB around above the keep limit");
+    }
 }

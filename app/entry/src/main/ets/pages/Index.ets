@@ -1,6 +1,7 @@
 import { vpnExtension, connection, socket } from '@kit.NetworkKit';
 import { commonEventManager, BusinessError, pasteboard, zlib } from '@kit.BasicServicesKit';
-import { common, Want, wantAgent, WantAgent } from '@kit.AbilityKit';
+import { util } from '@kit.ArkTS';
+import { bundleManager, common, Want, wantAgent, WantAgent } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { notificationManager } from '@kit.NotificationKit';
@@ -19,6 +20,7 @@ import {
   VpnPrefs, DEFAULT_PREFS, VpnSettings, DnsMode, isValidDnsAddress, normalizeDnsAddress
 } from '../settings/VpnSettings';
 import { DiagEntry, DiagStatusCounts, parseDiagLog, statusCounts } from '../diagnostics/DiagLog';
+import { chip, detailRow, factRow, groupTitle, navRow, rowDivider, segmented, toggleRow } from '../common/Ui';
 
 const DOMAIN = 0x0002;
 const TAG = 'YanouUi';
@@ -26,8 +28,18 @@ const TAG = 'YanouUi';
 const VPN_BUNDLE: string = 'com.maxime.muharmony';
 const VPN_ABILITY: string = 'YanouVpnAbility';
 
-/** Shown in exports and the About screen; bump it with the HAP version. */
-const APP_VERSION: string = '0.1.0';
+/** Shown in exports and on the About screen; the HAP is the only place it is set. */
+const APP_VERSION: string = readAppVersion();
+
+function readAppVersion(): string {
+  try {
+    const info: bundleManager.BundleInfo = bundleManager.getBundleInfoForSelfSync(
+      bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+    return info.versionName;
+  } catch (e) {
+    return '0.0.0';
+  }
+}
 
 /** One file inside a diagnostics export. */
 interface DiagManifestFile {
@@ -54,6 +66,12 @@ const CARD_RADIUS: number = 16;
 const PAGE_GUTTER: number = 16;
 const CONTENT_MAX_WIDTH: number = 720;
 const TOKEN_MARGIN_MS: number = 5 * 60 * 1000;
+/**
+ * The tunnel log is appended to for as long as diagnostics stay on, and it once reached
+ * 300 MB, which is more than a single read can turn into a string. Only its tail is read:
+ * that is where the newest attempts are, and the export path caps itself the same way.
+ */
+const LOG_TAIL_BYTES: number = 512 * 1024;
 /** Ongoing status notification: relay, state, Disconnect/Reconnect. */
 const VPN_NOTIFICATION_ID: number = 1001;
 /** One-shot notification when automatic reconnect gives up. */
@@ -106,7 +124,11 @@ function formatDate(iso: string): string {
   if (isNaN(at)) {
     return iso;
   }
-  return new Date(at).toISOString().slice(0, 10);
+  // Local, like every other date the app shows: a UTC slice can name the previous day.
+  const date = new Date(at);
+  const month: number = date.getMonth() + 1;
+  const day: number = date.getDate();
+  return `${date.getFullYear()}-${month < 10 ? '0' : ''}${month}-${day < 10 ? '0' : ''}${day}`;
 }
 
 function maskAccount(account: string): string {
@@ -198,7 +220,6 @@ struct Index {
   @State accountExpiryIso: string = '';
   /** Devices are read-only until "Manage" is tapped, so delete is a deliberate act. */
   @State acctEditDevices: boolean = false;
-  @State accountBusy: boolean = false;
 
   // Servers
   @State relays: RelayItem[] = [];
@@ -366,19 +387,6 @@ struct Index {
     }
   }
 
-  private recentRelays(): RelayItem[] {
-    const items: RelayItem[] = [];
-    for (const hostname of this.recentHostnames()) {
-      for (const relay of this.relays) {
-        if (relay.hostname === hostname) {
-          items.push(relay);
-          break;
-        }
-      }
-    }
-    return items;
-  }
-
   private filteredRelays(): RelayItem[] {
     const query: string = this.search.trim().toLowerCase();
     if (query.length === 0) {
@@ -390,29 +398,12 @@ struct Index {
       relay.country.toLowerCase().includes(query));
   }
 
-  /** Countries ordered by how often you have connected through them. */
-  private countries(): string[] {
-    const usage = this.usageMap();
-    const names: string[] = [];
-    for (const relay of this.filteredRelays()) {
-      const name: string = relay.country.length > 0 ? relay.country : relay.location;
-      if (!names.includes(name)) {
-        names.push(name);
-      }
-    }
-    names.sort((a: string, b: string) => {
-      const left: number = usage.get(a) ?? 0;
-      const right: number = usage.get(b) ?? 0;
-      if (left !== right) {
-        return right - left;
-      }
-      return a < b ? -1 : (a > b ? 1 : 0);
-    });
-    return names;
-  }
-
+  /**
+   * Relays in one country, from the full list: the browser filters its own copy, but the
+   * tunnel must never be narrowed by a search string left over in that browser.
+   */
   private relaysInCountry(country: string): RelayItem[] {
-    return this.filteredRelays().filter((relay: RelayItem) =>
+    return this.relays.filter((relay: RelayItem) =>
       (relay.country.length > 0 ? relay.country : relay.location) === country);
   }
 
@@ -426,6 +417,11 @@ struct Index {
    */
   private async openServers(mode: string = 'entry'): Promise<void> {
     this.serverMode = mode;
+    // Search, filter and expansion belong to one visit: the entry and exit lists share
+    // them otherwise, and a leftover query would look like a missing relay.
+    this.search = '';
+    this.srvFilter = 'all';
+    this.expandedCountry = '';
     this.loadCachedRelays();
     this.pageStack.pushPath({ name: 'servers' });
     const stamp: string = await VpnSettings.getString(getContext(this) as common.Context,
@@ -462,42 +458,27 @@ struct Index {
     }
   }
 
-  private async loadRelays(): Promise<void> {
-    if (this.relaysBusy) {
-      return;
-    }
-    this.relaysBusy = true;
-    this.relaysError = '';
-    try {
-      const items: RelayItem[] = await fetchRelays();
-      this.relays = items.filter((relay: RelayItem) =>
-        relay.active && (!this.prefs.daita || relay.daita))
-        .sort((a: RelayItem, b: RelayItem) => {
-          const left: string = `${a.country}|${a.city}|${a.hostname}`;
-          const right: string = `${b.country}|${b.city}|${b.hostname}`;
-          return left < right ? -1 : (left > right ? 1 : 0);
-        });
-    } catch (e) {
-      this.relaysError = this.describeError(e as Object);
-    } finally {
-      this.relaysBusy = false;
-    }
-  }
-
-  private matchingCountries(): string[] {
-    const query: string = this.search.trim().toLowerCase();
-    if (query.length === 0) {
-      return [];
-    }
-    return this.countries().filter((country: string) => country.toLowerCase().includes(query));
-  }
-
   private async selectCountry(country: string): Promise<void> {
     this.avoidHostname = '';
     const selection: RelaySelection = {
       kind: 'country',
       country: country,
       city: '',
+      hostname: '',
+      ipv4: '',
+      publicKey: ''
+    };
+    this.bumpUsage(country);
+    await this.connectSelection(selection);
+  }
+
+  /** Any relay in one city: the same "automatic" idea as a country, one level down. */
+  private async selectCity(country: string, city: string): Promise<void> {
+    this.avoidHostname = '';
+    const selection: RelaySelection = {
+      kind: 'city',
+      country: country,
+      city: city,
       hostname: '',
       ipv4: '',
       publicKey: ''
@@ -581,6 +562,9 @@ struct Index {
     if (this.selection.kind === 'country') {
       return `${this.selection.country} · automatic`;
     }
+    if (this.selection.kind === 'city') {
+      return `${this.selection.city}, ${this.selection.country} · automatic`;
+    }
     return this.selection.hostname;
   }
 
@@ -641,32 +625,60 @@ struct Index {
   }
 
   /** One-line state for the DNS row on the settings screen. */
+  /** One-line resolver state for the settings row. */
   private dnsSummary(): string {
-    if (this.prefs.dnsMode === 'custom' && this.prefs.customDns.length > 0) {
-      const count: number = this.prefs.customDns.length;
-      return `Custom · ${count} resolver${count > 1 ? 's' : ''}`;
+    if (this.prefs.dnsMode !== 'custom') {
+      return 'Automatic';
     }
-    const labels: string[] = [];
+    const count: number = this.prefs.customDns.length;
+    if (count === 0) {
+      return 'Custom · none added';
+    }
+    return count === 1 ? 'Custom · 1 resolver' : `Custom · ${count} resolvers`;
+  }
+
+  /** How many content-blocking categories are on. */
+  private blockCount(): number {
+    let count: number = 0;
     if (this.prefs.blockAds) {
-      labels.push('ads');
+      count += 1;
     }
     if (this.prefs.blockTrackers) {
-      labels.push('trackers');
+      count += 1;
     }
     if (this.prefs.blockMalware) {
-      labels.push('malware');
+      count += 1;
     }
     if (this.prefs.blockAdult) {
-      labels.push('adult content');
+      count += 1;
     }
     if (this.prefs.blockGambling) {
-      labels.push('gambling');
+      count += 1;
     }
     if (this.prefs.blockSocial) {
-      labels.push('social media');
+      count += 1;
     }
-    return labels.length === 0 ? 'Automatic · no blocking' : `Automatic · blocking ${labels.join(', ')}`;
+    return count;
   }
+
+  /** One-line content-blocking state, including the case where it cannot apply. */
+  private blockingSummary(): string {
+    const count: number = this.blockCount();
+    if (this.prefs.dnsMode !== 'auto') {
+      return count === 0 ? 'Off' : 'Needs automatic DNS';
+    }
+    return count === 0 ? 'Off' : `${count} of 6 on`;
+  }
+
+  /** Tail of the account number: enough to tell two accounts apart in a row. */
+  private accountValue(): string {
+    if (this.session === null) {
+      return '';
+    }
+    const digits: string = this.session.account.replace(/ /g, '');
+    return digits.length > 4 ? `•••• ${digits.slice(-4)}` : digits;
+  }
+
 
   private effectiveMtu(): number {
     if (!this.multihopActive()) {
@@ -688,6 +700,11 @@ struct Index {
     return `Multihop · exit ${this.exitLabel()}`;
   }
 
+  /** Transient confirmation; a silent button reads as a broken button. */
+  private toast(message: string): void {
+    promptAction.showToast({ message: message, duration: 1800 });
+  }
+
   private readLogs(): void {
     const path: string = `${getContext(this).filesDir}/yanou-native.log`;
     try {
@@ -696,11 +713,34 @@ struct Index {
         this.diagEntries = [];
         return;
       }
-      this.logText = fs.readTextSync(path);
+      this.logText = this.readLogTail(path);
       this.diagEntries = parseDiagLog(this.logText);
     } catch (e) {
-      this.logText = `Log read failed: ${JSON.stringify(e)}`;
-      this.diagEntries = [];
+      const err = e as BusinessError;
+      hilog.warn(DOMAIN, TAG, 'log read failed %{public}d', err.code ?? -1);
+      this.toast('Could not read the log. Is diagnostics on?');
+    }
+  }
+
+  /** The last `LOG_TAIL_BYTES` of the log, or the whole file when it is smaller. */
+  private readLogTail(path: string): string {
+    const size: number = fs.statSync(path).size;
+    if (size <= LOG_TAIL_BYTES) {
+      return fs.readTextSync(path);
+    }
+    const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
+    try {
+      const length: number = LOG_TAIL_BYTES;
+      const buffer: ArrayBuffer = new ArrayBuffer(length);
+      const read: number = fs.readSync(file.fd, buffer, {
+        offset: size - length,
+        length: length
+      });
+      // A tail can start inside a multi-byte character; the decoder replaces that byte.
+      const decoder: util.TextDecoder = util.TextDecoder.create('utf-8');
+      return decoder.decodeToString(new Uint8Array(buffer.slice(0, read)));
+    } finally {
+      fs.closeSync(file);
     }
   }
 
@@ -1218,6 +1258,14 @@ struct Index {
     this.accountNumber = '';
     this.loginError = '';
     this.accountExpiry = '';
+    this.accountExpiryIso = '';
+    this.devices = [];
+    this.devicesError = '';
+    this.removingId = '';
+    this.revealAccount = false;
+    this.acctEditDevices = false;
+    this.canManageDevices = false;
+    this.pendingToken = '';
     this.packets = 0;
     this.bytes = 0;
     try {
@@ -1364,6 +1412,12 @@ struct Index {
     if (this.selection.kind === 'relay') {
       return this.relays.filter((relay: RelayItem) => relay.hostname === this.selection?.hostname);
     }
+    if (this.selection.kind === 'city') {
+      const city: string = this.selection.city;
+      return this.relaysInCountry(this.selection.country)
+        .filter((relay: RelayItem) => relay.city === city)
+        .slice(0, 8);
+    }
     return this.relaysInCountry(this.selection.country).slice(0, 8);
   }
 
@@ -1509,6 +1563,25 @@ struct Index {
     };
   }
 
+  /** Wording of the main button, in one place so its icon and label never disagree. */
+  private primaryLabel(): string {
+    if (this.sessionActive()) {
+      return 'Disconnect';
+    }
+    return this.phase === 'lost' ? 'Reconnect' : 'Connect';
+  }
+
+  /** The main button: stop a live attempt, or start one, or pick up after a drop. */
+  private async onPrimary(): Promise<void> {
+    if (this.sessionActive()) {
+      await this.stopTunnel();
+    } else if (this.phase === 'lost') {
+      await this.reconnectTunnel();
+    } else {
+      await this.startTunnel();
+    }
+  }
+
   private async toggleTunnel(): Promise<void> {
     if (this.sessionActive()) {
       await this.stopTunnel();
@@ -1652,7 +1725,7 @@ struct Index {
     }
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, current.account);
     pasteboard.getSystemPasteboard().setData(data).then(() => {
-      this.acctToast('Account number copied');
+      this.toast('Account number copied');
     }).catch((err: BusinessError) => {
       hilog.warn(DOMAIN, TAG, 'clipboard failed %{public}d', err.code);
     });
@@ -1809,6 +1882,9 @@ struct Index {
               .caretColor($r('sys.color.brand'))
               .onChange((value: string) => {
                 this.accountNumber = value;
+                // The pending token belongs to the number that hit the device limit.
+                this.canManageDevices = false;
+                this.pendingToken = '';
               })
             Button() {
               Text(this.loginBusy ? 'Signing in…' : 'Sign in')
@@ -1881,7 +1957,7 @@ struct Index {
   @Builder
   aboutScreen() {
     Scroll() {
-      Column({ space: 18 }) {
+      Column({ space: 20 }) {
         Column({ space: 4 }) {
           Text('燕鸥')
             .fontSize(26)
@@ -1893,6 +1969,20 @@ struct Index {
         }
         .alignItems(HorizontalAlign.Start)
         .width('100%')
+
+        Column() {
+          factRow('Version', APP_VERSION)
+          rowDivider()
+          factRow('Licence', 'GPL-3.0-or-later')
+          rowDivider()
+          factRow('Runs on', 'HarmonyOS NEXT')
+          rowDivider()
+          factRow('Based on', 'mullvadvpn-app')
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16 })
+        .borderRadius(CARD_RADIUS)
+        .backgroundColor($r('sys.color.comp_background_primary'))
 
         Column({ space: 6 }) {
           Text('This app is a client, not a service')
@@ -1954,17 +2044,6 @@ struct Index {
         }
         .alignItems(HorizontalAlign.Start)
         .width('100%')
-
-        Button('Close')
-          .type(ButtonType.Capsule)
-          .height(40)
-          .width('100%')
-          .fontSize(15)
-          .backgroundColor($r('sys.color.comp_background_secondary'))
-          .fontColor($r('sys.color.brand'))
-          .onClick(() => {
-            this.pageStack.pop();
-          })
       }
       .width('100%')
       .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 24 })
@@ -1975,6 +2054,8 @@ struct Index {
     .scrollBar(BarState.Off)
     .align(Alignment.TopStart)
   }
+
+
 
   // ---------------------------------------------------------------- main
 
@@ -1996,66 +2077,33 @@ struct Index {
 
         Blank()
 
-        Row({ space: 18 }) {
-          SymbolGlyph($r('sys.symbol.person'))
-            .fontSize(22)
-            .fontColor([$r('sys.color.font_secondary')])
-            .onClick(() => {
-              this.loadAccountExpiry();
-              this.loadDevices();
-              this.pageStack.pushPath({ name: 'account' });
-            })
-          SymbolGlyph($r('sys.symbol.gearshape'))
-            .fontSize(22)
-            .fontColor([$r('sys.color.font_secondary')])
-            .onClick(() => {
-              this.pageStack.pushPath({ name: 'settings' });
-            })
-        }
+        SymbolGlyph($r('sys.symbol.gearshape'))
+          .fontSize(22)
+          .fontColor([$r('sys.color.font_secondary')])
+          .onClick(() => {
+            this.pageStack.pushPath({ name: 'settings' });
+          })
       }
       .width('100%')
-      .height(64)
+      .height(56)
       .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER })
       .alignItems(VerticalAlign.Center)
 
-      // Outside the card, so a lost or failed tunnel stays visible while the page scrolls.
-      if (this.phase === 'lost') {
-        Row({ space: 8 }) {
-          SymbolGlyph($r('sys.symbol.exclamationmark_triangle'))
-            .fontSize(18)
-            .fontColor([$r('sys.color.alert')])
-          Text(this.retrying ? 'Connection lost — reconnecting…' : 'Connection lost')
-            .fontSize(13)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('sys.color.alert'))
-            .layoutWeight(1)
-          Text('Reconnect')
-            .fontSize(13)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('sys.color.brand'))
-            .padding({ left: 8, top: 4, bottom: 4 })
-            .onClick(() => {
-              this.reconnectTunnel();
-            })
-        }
-        .width('100%')
-        .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 10, bottom: 10 })
-        .backgroundColor($r('sys.color.comp_background_secondary'))
-        .alignItems(VerticalAlign.Center)
-      }
-
+      // One card describes the connection and nothing else; the numbers that used to sit
+      // in a second card live in the details sheet, so the page fits without scrolling.
       Scroll() {
         Column({ space: 12 }) {
-          Column({ space: 12 }) {
+          Column({ space: 8 }) {
             Stack() {
               Circle()
                 .width(96)
                 .height(96)
                 .fill(this.sessionActive() || this.phase === 'failed' || this.phase === 'lost' ?
                   this.phaseColor() : $r('sys.color.comp_background_secondary'))
-                .opacity(this.sessionActive() || this.phase === 'failed' || this.phase === 'lost' ? 0.14 : 1)
+                .opacity(this.sessionActive() || this.phase === 'failed' ||
+                  this.phase === 'lost' ? 0.14 : 1)
               SymbolGlyph($r('sys.symbol.power'))
-                .fontSize(40)
+                .fontSize(36)
                 .fontColor([this.phaseColor()])
             }
             .width(96)
@@ -2068,34 +2116,18 @@ struct Index {
                 this.phaseColor() : $r('sys.color.font_primary'))
 
             Text(this.statusDetail())
-              .fontSize(14)
+              .fontSize(13)
               .fontColor(this.phase === 'failed' || this.phase === 'lost' ?
                 $r('sys.color.alert') : $r('sys.color.font_secondary'))
               .textAlign(TextAlign.Center)
-              .maxLines(3)
+              .maxLines(2)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
-
-            // "Automatic" hides which relay was picked; once a candidate answers, name it.
-            if (this.sessionActive() && this.tunnelTarget.length > 0) {
-              Text(this.tunnelTarget)
-                .fontSize(13)
-                .fontColor($r('sys.color.brand'))
-                .textAlign(TextAlign.Center)
-            }
-
-            // Measured by the extension (device up → handshake), 0 means it is not known.
-            if (this.phase === 'connected' && this.handshakeMs > 0) {
-              Text(`${this.handshakeMs} ms handshake`)
-                .fontSize(12)
-                .fontColor($r('sys.color.font_secondary'))
-                .textAlign(TextAlign.Center)
-            }
 
             if (this.sessionActive()) {
               Row() {
                 Column({ space: 2 }) {
                   Text(formatBytes(this.rxBytes))
-                    .fontSize(20)
+                    .fontSize(18)
                     .fontWeight(FontWeight.Medium)
                     .fontColor($r('sys.color.font_primary'))
                   Text('received')
@@ -2106,7 +2138,7 @@ struct Index {
 
                 Column({ space: 2 }) {
                   Text(formatBytes(this.txBytes))
-                    .fontSize(20)
+                    .fontSize(18)
                     .fontWeight(FontWeight.Medium)
                     .fontColor($r('sys.color.font_primary'))
                   Text('sent')
@@ -2115,19 +2147,20 @@ struct Index {
                 }
                 .layoutWeight(1)
 
+                // Measured by the extension (device up to handshake); 0 means unknown.
                 Column({ space: 2 }) {
-                  Text(`${this.packets}`)
-                    .fontSize(20)
+                  Text(this.handshakeMs > 0 ? `${this.handshakeMs}` : '—')
+                    .fontSize(18)
                     .fontWeight(FontWeight.Medium)
                     .fontColor($r('sys.color.font_primary'))
-                  Text('captured')
+                  Text('handshake ms')
                     .fontSize(11)
                     .fontColor($r('sys.color.font_secondary'))
                 }
                 .layoutWeight(1)
               }
               .width('100%')
-              .margin({ top: 12 })
+              .margin({ top: 4 })
             }
 
             if (this.sessionActive() || this.phase === 'failed' || this.phase === 'lost') {
@@ -2139,11 +2172,10 @@ struct Index {
                   .fontSize(14)
                   .fontColor([$r('sys.color.font_tertiary')])
               }
-              .margin({ top: 4 })
             }
           }
           .width('100%')
-          .padding({ top: 28, bottom: 28, left: 20, right: 20 })
+          .padding({ top: 24, bottom: 24, left: 16, right: 16 })
           .borderRadius(CARD_RADIUS)
           .backgroundColor($r('sys.color.comp_background_primary'))
           .alignItems(HorizontalAlign.Center)
@@ -2176,84 +2208,24 @@ struct Index {
           }
 
           Column() {
-            Row() {
-              Text('Servers')
-                .fontSize(15)
-                .fontColor($r('sys.color.font_primary'))
-              Blank()
-              Text(this.sessionActive() && this.tunnelTarget.length > 0 ?
-                this.tunnelTarget : this.relayLabel())
-                .fontSize(13)
-                .fontColor($r('sys.color.font_tertiary'))
-              SymbolGlyph($r('sys.symbol.chevron_right'))
-                .fontSize(16)
-                .fontColor([$r('sys.color.font_tertiary')])
-                .margin({ left: 4 })
-            }
-            .width('100%')
-            .height(48)
-            .onClick(() => {
+            navRow('Servers', this.sessionActive() && this.tunnelTarget.length > 0 ?
+              this.tunnelTarget : this.relayLabel(), false, () => {
               this.openServers();
             })
-
             // The entry stays the "Servers" row; multihop only adds the second hop here.
             if (this.prefs.multihop) {
-              Divider()
-                .strokeWidth(0.5)
-                .color($r('sys.color.comp_divider'))
-              Row() {
-                Text('Exit')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Blank()
-                Text(this.exitSelection === null ? 'Not selected' : this.exitLabel())
-                  .fontSize(13)
-                  .fontColor(this.exitSelection === null ?
-                    $r('sys.color.font_tertiary') : $r('sys.color.brand'))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                SymbolGlyph($r('sys.symbol.chevron_right'))
-                  .fontSize(16)
-                  .fontColor([$r('sys.color.font_tertiary')])
-                  .margin({ left: 4 })
-              }
-              .width('100%')
-              .height(48)
-              .onClick(() => {
-                this.openServers('exit');
-              })
+              rowDivider()
+              navRow('Exit', this.exitSelection === null ? 'Not selected' : this.exitLabel(),
+                this.exitSelection !== null, () => {
+                  this.openServers('exit');
+                })
             }
-
           }
           .width('100%')
           .padding({ left: 16, right: 16 })
           .borderRadius(CARD_RADIUS)
           .backgroundColor($r('sys.color.comp_background_primary'))
 
-          Column({ space: 8 }) {
-            Text('Tunnel configuration')
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(`vNIC ${this.session?.ipv4 ?? '-'} · MTU ${this.effectiveMtu()} · ` +
-              `DNS ${this.dnsLabel()}`)
-              .fontSize(13)
-              .fontColor($r('sys.color.font_tertiary'))
-            Text(`${this.ipModeLabel()} · kill switch ${this.prefs.killSwitch ? 'on' : 'off'}`)
-              .fontSize(13)
-              .fontColor($r('sys.color.font_tertiary'))
-            Text(this.multihopSummary())
-              .fontSize(13)
-              .fontColor(this.multihopActive() ?
-                $r('sys.color.brand') : $r('sys.color.font_tertiary'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .padding(16)
-          .borderRadius(CARD_RADIUS)
-          .backgroundColor($r('sys.color.comp_background_primary'))
-          .alignItems(HorizontalAlign.Start)
         }
         .width('100%')
         .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 4, bottom: 16 })
@@ -2285,13 +2257,15 @@ struct Index {
 
         Button() {
           Row({ space: 8 }) {
-            SymbolGlyph($r('sys.symbol.power'))
+            SymbolGlyph(this.sessionActive() ? $r('sys.symbol.power') : $r('sys.symbol.bolt_shield'))
               .fontSize(20)
-              .fontColor([this.sessionActive() ? $r('sys.color.font_primary') : $r('sys.color.font_on_primary')])
-            Text(this.sessionActive() ? 'Disconnect' : 'Connect')
+              .fontColor([this.sessionActive() ? $r('sys.color.font_primary') :
+                $r('sys.color.font_on_primary')])
+            Text(this.primaryLabel())
               .fontSize(16)
               .fontWeight(FontWeight.Medium)
-              .fontColor(this.sessionActive() ? $r('sys.color.font_primary') : $r('sys.color.font_on_primary'))
+              .fontColor(this.sessionActive() ? $r('sys.color.font_primary') :
+                $r('sys.color.font_on_primary'))
           }
         }
         .type(ButtonType.Capsule)
@@ -2299,9 +2273,10 @@ struct Index {
         .height(48)
         .enabled(!this.busy)
         .opacity(this.busy ? 0.6 : 1)
-        .backgroundColor(this.sessionActive() ? $r('sys.color.comp_background_secondary') : $r('sys.color.brand'))
+        .backgroundColor(this.sessionActive() ? $r('sys.color.comp_background_secondary') :
+          $r('sys.color.brand'))
         .onClick(() => {
-          this.toggleTunnel();
+          this.onPrimary();
         })
       }
       .width('100%')
@@ -2311,191 +2286,65 @@ struct Index {
     .height('100%')
   }
 
+
   /**
-   * Read-only mirror of what the extension last published. Opened from the hero card;
-   * every value here comes from state and nothing on the sheet changes the connection.
+   * Read-only mirror of what the extension last published, plus the tunnel facts that
+   * used to take a whole card on the main screen. Nothing here changes the connection.
    */
   @Builder
   connectionSheet() {
     Scroll() {
       Column({ space: 12 }) {
         Column() {
-          Row({ space: 12 }) {
-            Text('Status')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.statusTitle())
-              .fontSize(14)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(this.phaseColor())
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          detailRow('Status', this.statusTitle(), this.phaseColor())
+          rowDivider()
+          detailRow('Relay', this.tunnelTarget.length > 0 ? this.tunnelTarget : this.relayLabel(),
+            $r('sys.color.font_primary'))
+          if (this.multihopActive()) {
+            rowDivider()
+            detailRow('Exit', this.exitLabel(), $r('sys.color.brand'))
           }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
+          rowDivider()
+          detailRow('Endpoint', this.endpoint.length > 0 ? this.endpoint : '—',
+            $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('Transport', this.transport.length > 0 ? this.transport : '—',
+            $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('Address family', this.family.length > 0 ? this.family : '—',
+            $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('Handshake', this.handshakeMs > 0 ? `${this.handshakeMs} ms` : '—',
+            $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('Uptime', this.uptimeMs > 0 ? formatUptime(this.uptimeMs) : '—',
+            $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('Received', formatBytes(this.rxBytes), $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('Sent', formatBytes(this.txBytes), $r('sys.color.font_primary'))
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16 })
+        .borderRadius(CARD_RADIUS)
+        .backgroundColor($r('sys.color.comp_background_primary'))
 
-          Row({ space: 12 }) {
-            Text('Relay')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.tunnelTarget.length > 0 ? this.tunnelTarget : this.relayLabel())
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(2)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Endpoint')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.endpoint.length > 0 ? this.endpoint : '—')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(2)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Transport')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.transport.length > 0 ? this.transport : '—')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Address family')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.family.length > 0 ? this.family : '—')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Handshake')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.handshakeMs > 0 ? `${this.handshakeMs} ms` : '—')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Uptime')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.uptimeMs > 0 ? formatUptime(this.uptimeMs) : '—')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Received')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(formatBytes(this.rxBytes))
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Sent')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(formatBytes(this.txBytes))
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Protector fd')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.protectedFd >= 0 ? `${this.protectedFd}` : '—')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: 12 }) {
-            Text('Continuous task')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-            Text(this.keepAlive ? 'active' : 'off')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_primary'))
-              .layoutWeight(1)
-              .textAlign(TextAlign.End)
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .width('100%')
-          .constraintSize({ minHeight: 38 })
-          .alignItems(VerticalAlign.Center)
+        Column() {
+          detailRow('Device address', this.session !== null ? this.session.ipv4 : '—',
+            $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('MTU', `${this.effectiveMtu()}`, $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('DNS', this.dnsLabel(), $r('sys.color.brand'))
+          rowDivider()
+          detailRow('Kill switch', this.prefs.killSwitch ? 'on' : 'off',
+            $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('Protector fd', this.protectedFd >= 0 ? `${this.protectedFd}` : '—',
+            $r('sys.color.font_primary'))
+          rowDivider()
+          detailRow('Continuous task', this.keepAlive ? 'active' : 'off',
+            $r('sys.color.font_primary'))
         }
         .width('100%')
         .padding({ left: 16, right: 16 })
@@ -2510,6 +2359,8 @@ struct Index {
           .fontColor($r('sys.color.font_primary'))
           .backgroundColor($r('sys.color.comp_background_secondary'))
           .onClick(() => {
+            this.readLogs();
+            this.diagStartTail();
             this.pageStack.pushPath({ name: 'logs' });
             this.detailsVisible = false;
           })
@@ -2526,40 +2377,56 @@ struct Index {
 
   // ---------------------------------------------------------------- devices
 
+  /**
+   * Only reached from the login screen when the account already holds five devices, where
+   * removing one is the only way in. Once signed in, Account owns the same list.
+   */
   @Builder
   devicesScreen() {
-    Column() {
-      Text('A Mullvad account can have five devices. Remove one to free a slot for this tablet.')
-        .fontSize(13)
-        .fontColor($r('sys.color.font_secondary'))
-        .lineHeight(18)
-        .padding({ left: 20, right: 20, top: 8, bottom: 12 })
-
-      if (this.devicesBusy) {
-        LoadingProgress()
-          .width(40)
-          .height(40)
-          .color($r('sys.color.brand'))
-          .margin({ top: 24 })
-      }
-
-      if (this.devicesError.length > 0) {
-        Text(this.devicesError)
+    Scroll() {
+      Column({ space: 16 }) {
+        Text('A Mullvad account can have five devices. Remove one to free a slot for this device.')
           .fontSize(13)
-          .fontColor($r('sys.color.alert'))
-          .padding({ left: 20, right: 20, top: 8 })
-      }
+          .fontColor($r('sys.color.font_secondary'))
+          .lineHeight(19)
 
-      Scroll() {
         Column() {
-          ForEach(this.devices, (device: DeviceResponse) => {
+          if (this.devicesBusy && this.devices.length === 0) {
+            LoadingProgress()
+              .width(32)
+              .height(32)
+              .color($r('sys.color.brand'))
+              .margin({ top: 16, bottom: 16 })
+          }
+
+          if (this.devicesError.length > 0) {
+            Text(this.devicesError)
+              .fontSize(13)
+              .fontColor($r('sys.color.alert'))
+              .width('100%')
+              .padding({ top: 12, bottom: 12 })
+          }
+
+          if (this.devices.length === 0 && !this.devicesBusy && this.devicesError.length === 0) {
+            Text('No devices on this account yet.')
+              .fontSize(13)
+              .fontColor($r('sys.color.font_secondary'))
+              .width('100%')
+              .padding({ top: 12, bottom: 12 })
+          }
+
+          ForEach(this.devices, (device: DeviceResponse, index: number) => {
             Column() {
+              if (index > 0) {
+                rowDivider()
+              }
               Row() {
-                Column({ space: 4 }) {
+                Column({ space: 2 }) {
                   Text(device.name)
                     .fontSize(15)
-                    .fontWeight(FontWeight.Medium)
                     .fontColor($r('sys.color.font_primary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
                   Text(`${device.ipv4_address} · added ${formatDate(device.created)}`)
                     .fontSize(12)
                     .fontColor($r('sys.color.font_secondary'))
@@ -2573,18 +2440,16 @@ struct Index {
                     .height(24)
                     .color($r('sys.color.brand'))
                 } else {
-                  Button() {
-                    SymbolGlyph($r('sys.symbol.trash'))
-                      .fontSize(18)
-                      .fontColor([$r('sys.color.alert')])
-                  }
-                  .type(ButtonType.Circle)
-                  .width(40)
-                  .height(40)
-                  .backgroundColor($r('sys.color.comp_background_secondary'))
-                  .onClick(() => {
-                    this.confirmRemove(device);
-                  })
+                  Button('Remove')
+                    .type(ButtonType.Capsule)
+                    .height(32)
+                    .padding({ left: 14, right: 14 })
+                    .fontSize(13)
+                    .backgroundColor($r('sys.color.comp_background_secondary'))
+                    .fontColor($r('sys.color.alert'))
+                    .onClick(() => {
+                      this.confirmRemove(device);
+                    })
                 }
               }
               .width('100%')
@@ -2595,15 +2460,13 @@ struct Index {
         }
         .width('100%')
         .padding({ left: 16, right: 16 })
-      }
-      .layoutWeight(1)
-      .align(Alignment.TopStart)
+        .borderRadius(CARD_RADIUS)
+        .backgroundColor($r('sys.color.comp_background_primary'))
 
-      Row() {
         Button('Refresh')
           .type(ButtonType.Capsule)
-          .height(44)
           .width('100%')
+          .height(44)
           .backgroundColor($r('sys.color.comp_background_secondary'))
           .fontColor($r('sys.color.font_primary'))
           .enabled(!this.devicesBusy)
@@ -2611,10 +2474,16 @@ struct Index {
             this.loadDevices();
           })
       }
-      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, bottom: PAGE_GUTTER })
+      .width('100%')
+      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 24 })
     }
     .width('100%')
     .height('100%')
+    .align(Alignment.TopStart)
+    .scrollBar(BarState.Off)
+    .onAppear(() => {
+      this.loadDevices();
+    })
   }
 
   // ---------------------------------------------------------------- servers
@@ -2830,7 +2699,7 @@ struct Index {
             .fontColor($r('sys.color.font_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(relay.hostname)
+          Text(relay.daita ? `${relay.hostname} · DAITA` : relay.hostname)
             .fontSize(12)
             .fontColor($r('sys.color.font_secondary'))
             .maxLines(1)
@@ -2838,12 +2707,6 @@ struct Index {
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
-
-        if (relay.daita) {
-          Text('DAITA')
-            .fontSize(11)
-            .fontColor($r('sys.color.brand'))
-        }
 
         if (this.srvIsSelected(relay)) {
           SymbolGlyph($r('sys.symbol.bolt_shield'))
@@ -2857,18 +2720,20 @@ struct Index {
         this.srvTapRelay(relay);
       })
 
-      // The checkmark doubles as the favourite toggle: tap it to pin or unpin a relay.
-      SymbolGlyph($r('sys.symbol.checkmark'))
-        .fontSize(16)
-        .fontColor([this.srvIsFavourite(relay.hostname) ?
-          $r('sys.color.brand') : $r('sys.color.font_tertiary')])
-        .padding(8)
-        .borderRadius(16)
-        .backgroundColor(this.srvIsFavourite(relay.hostname) ?
-          $r('sys.color.comp_background_primary') : Color.Transparent)
-        .onClick(() => {
-          this.srvToggleFavourite(relay);
-        })
+      // A star, so it cannot be mistaken for the checkmark that marks the selection.
+      Row() {
+        SymbolGlyph(this.srvIsFavourite(relay.hostname) ?
+          $r('sys.symbol.star_fill') : $r('sys.symbol.star'))
+          .fontSize(18)
+          .fontColor([this.srvIsFavourite(relay.hostname) ?
+            $r('sys.color.brand') : $r('sys.color.font_tertiary')])
+      }
+      .width(40)
+      .height(40)
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => {
+        this.srvToggleFavourite(relay);
+      })
     }
     .width('100%')
     .height(56)
@@ -3026,21 +2891,18 @@ struct Index {
   }
 
   /** Compact capsule used for the All / DAITA / Owned / Recent filters. */
-  @Builder
-  srvFilterChip(label: string, value: string) {
-    Button(label)
-      .type(ButtonType.Capsule)
-      .height(32)
-      .padding({ left: 14, right: 14 })
-      .fontSize(12)
-      .fontWeight(FontWeight.Medium)
-      .fontColor(this.srvFilter === value ? $r('sys.color.font_on_primary') :
-        $r('sys.color.font_secondary'))
-      .backgroundColor(this.srvFilter === value ? $r('sys.color.brand') :
-        $r('sys.color.comp_background_secondary'))
-      .onClick(() => {
-        this.srvFilter = value;
-      })
+  /** Filter chip labels, in the order the row shows them. */
+  private srvFilterLabel(value: string): string {
+    if (value === 'daita') {
+      return 'DAITA';
+    }
+    if (value === 'owned') {
+      return 'Owned';
+    }
+    if (value === 'recent') {
+      return 'Recent';
+    }
+    return 'All';
   }
 
   @Builder
@@ -3137,7 +2999,7 @@ struct Index {
     .width('100%')
     .height(56)
     .onClick(() => {
-      this.selectCountry(relay.country);
+      this.selectCity(relay.country, relay.city);
     })
   }
 
@@ -3248,11 +3110,12 @@ struct Index {
         .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 8 })
       }
 
-      Row() {
+      Row({ space: 8 }) {
         TextInput({
           placeholder: this.serverMode === 'exit' ? 'Search exit relay' : 'Search country, city or relay',
           text: this.search
         })
+          .layoutWeight(1)
           .height(40)
           .fontSize(14)
           .backgroundColor($r('sys.color.comp_background_secondary'))
@@ -3262,14 +3125,37 @@ struct Index {
           .onChange((value: string) => {
             this.search = value;
           })
+
+        // The list changes daily; refetching on demand is cheaper than on every open.
+        Row() {
+          if (this.relaysBusy) {
+            LoadingProgress()
+              .width(18)
+              .height(18)
+              .color($r('sys.color.font_tertiary'))
+          } else {
+            SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+              .fontSize(18)
+              .fontColor([$r('sys.color.font_secondary')])
+          }
+        }
+        .width(40)
+        .height(40)
+        .justifyContent(FlexAlign.Center)
+        .borderRadius(20)
+        .backgroundColor($r('sys.color.comp_background_secondary'))
+        .onClick(() => {
+          this.refreshRelays();
+        })
       }
       .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 8, bottom: 6 })
 
       Row({ space: 8 }) {
-        this.srvFilterChip('All', 'all')
-        this.srvFilterChip('DAITA', 'daita')
-        this.srvFilterChip('Owned', 'owned')
-        this.srvFilterChip('Recent', 'recent')
+        ForEach(['all', 'daita', 'owned', 'recent'], (value: string) => {
+          chip(this.srvFilterLabel(value), this.srvFilter === value, () => {
+            this.srvFilter = value;
+          })
+        }, (value: string) => value)
       }
       .width('100%')
       .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, bottom: 6 })
@@ -3303,7 +3189,9 @@ struct Index {
       }
 
       if (this.relays.length === 0) {
-        this.srvEmptyState()
+        if (!this.relaysBusy && this.relaysError.length === 0) {
+          this.srvEmptyState()
+        }
       } else {
         Scroll() {
           Column() {
@@ -3550,6 +3438,7 @@ struct Index {
       const chosenProbe: string = await this.probeResolver(chosen);
       native.logLine(`dns check: ${chosen}:53 -> ${chosenProbe}`);
     }
+    let blocked: number = 0;
     for (const host of hosts) {
       try {
         const addresses: connection.NetAddress[] = await connection.getAddressesByName(host);
@@ -3557,31 +3446,40 @@ struct Index {
         native.logLine(`dns check: ${host} -> ${first}`);
       } catch (e) {
         const err = e as BusinessError;
+        blocked += 1;
         native.logLine(`dns check: ${host} -> failed (${err.code ?? -1})`);
       }
     }
     this.readLogs();
+    this.toast(blocked > 0 ? `${blocked} of ${hosts.length} names blocked · see the log` :
+      'No name was blocked · see the log');
   }
 
   /** Writes a string to a picked document URI. */
   private async saveText(uri: string, text: string): Promise<void> {
     const file = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-    fs.writeSync(file.fd, text);
-    fs.closeSync(file);
+    try {
+      fs.writeSync(file.fd, text);
+    } finally {
+      fs.closeSync(file);
+    }
   }
 
   /** Copies a file to a picked document URI in chunks; the picker gives a content URI. */
   private async saveFile(uri: string, path: string): Promise<void> {
     const src = fs.openSync(path, fs.OpenMode.READ_ONLY);
     const dst = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-    const buffer: ArrayBuffer = new ArrayBuffer(64 * 1024);
-    let read: number = fs.readSync(src.fd, buffer);
-    while (read > 0) {
-      fs.writeSync(dst.fd, buffer, { length: read });
-      read = fs.readSync(src.fd, buffer);
+    try {
+      const buffer: ArrayBuffer = new ArrayBuffer(64 * 1024);
+      let read: number = fs.readSync(src.fd, buffer);
+      while (read > 0) {
+        fs.writeSync(dst.fd, buffer, { length: read });
+        read = fs.readSync(src.fd, buffer);
+      }
+    } finally {
+      fs.closeSync(src);
+      fs.closeSync(dst);
     }
-    fs.closeSync(src);
-    fs.closeSync(dst);
   }
 
   /** The whole native log as one text file, for when the entries are not enough. */
@@ -3595,8 +3493,10 @@ struct Index {
         return;
       }
       await this.saveText(uris[0], this.logText);
+      this.toast('Log exported.');
     } catch (e) {
-      this.logText = `Export failed: ${JSON.stringify(e)}`;
+      hilog.warn(DOMAIN, TAG, 'raw export failed %{public}s', JSON.stringify(e));
+      this.toast('Export failed.');
     }
   }
 
@@ -3609,7 +3509,7 @@ struct Index {
    */
   private async diagExportZip(): Promise<void> {
     if (this.diagEntries.length === 0) {
-      this.logText = 'Nothing to export yet. Connect once with diagnostics on.';
+      this.toast('Nothing to export yet. Connect once with diagnostics on.');
       return;
     }
     const context = getContext(this) as common.Context;
@@ -3667,8 +3567,17 @@ struct Index {
         return;
       }
       await this.saveFile(uris[0], zipPath);
+      this.toast(`${files.length} attempts exported.`);
     } catch (e) {
-      this.logText = `Export failed: ${JSON.stringify(e)}`;
+      hilog.warn(DOMAIN, TAG, 'zip export failed %{public}s', JSON.stringify(e));
+      this.toast('Export failed.');
+    } finally {
+      // The zip and its parts are only a staging area; the picker already has a copy.
+      try {
+        fs.rmdirSync(dir);
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'staging cleanup failed');
+      }
     }
   }
 
@@ -3679,7 +3588,13 @@ struct Index {
       return;
     }
     try {
-      const index: number = Math.max(0, this.diagEntries.indexOf(entry)) + 1;
+      // The list can change under the sheet (a new attempt appends while it is open).
+      const position: number = this.diagEntries.indexOf(entry);
+      if (position < 0) {
+        this.toast('This attempt is no longer in the list.');
+        return;
+      }
+      const index: number = position + 1;
       const total: number = this.diagEntries.length > 0 ? this.diagEntries.length : 1;
       const section: string = this.entryHeader(entry, index, total, this.stampHuman()) +
         entry.body + '\n';
@@ -3692,9 +3607,11 @@ struct Index {
         return;
       }
       await this.saveText(uris[0], section);
+      this.toast('Attempt exported.');
     } catch (e) {
       // Keep the list and the raw log intact: a failed save must not look like a log read.
       hilog.warn(DOMAIN, TAG, 'entry export failed %{public}s', JSON.stringify(e));
+      this.toast('Export failed.');
     }
   }
 
@@ -3721,7 +3638,7 @@ struct Index {
 
   /** Filter chips in a fixed order, so they do not jump as counts change. */
   private diagFilters(): string[] {
-    return ['all', 'failed', 'connected', 'stopped'];
+    return ['all', 'connected', 'failed', 'stopped', 'incomplete'];
   }
 
   /** Entries matching the active chip; `all` keeps the unfiltered list. */
@@ -3729,21 +3646,30 @@ struct Index {
     if (this.diagFilter === 'all') {
       return this.diagEntries;
     }
+    if (this.diagFilter === 'incomplete') {
+      // `incomplete` and `legacy` are the attempts that never reported a result.
+      return this.diagEntries.filter((entry: DiagEntry) =>
+        entry.status !== 'connected' && entry.status !== 'failed' && entry.status !== 'stopped');
+    }
     const status: string = this.diagFilter;
     return this.diagEntries.filter((entry: DiagEntry) => entry.status === status);
   }
 
   /** Chip label with its count, e.g. `Failed 3`; a zero count stays a plain label. */
   private diagChipLabel(filter: string): string {
+    const counts: DiagStatusCounts = statusCounts(this.diagEntries);
+    const other: number = this.diagEntries.length - counts.connected - counts.failed - counts.stopped;
     if (filter === 'all') {
       return this.diagEntries.length > 0 ? `All ${this.diagEntries.length}` : 'All';
     }
-    const counts: DiagStatusCounts = statusCounts(this.diagEntries);
     if (filter === 'failed') {
       return counts.failed > 0 ? `Failed ${counts.failed}` : 'Failed';
     }
     if (filter === 'connected') {
       return counts.connected > 0 ? `Connected ${counts.connected}` : 'Connected';
+    }
+    if (filter === 'incomplete') {
+      return other > 0 ? `Incomplete ${other}` : 'Incomplete';
     }
     return counts.stopped > 0 ? `Stopped ${counts.stopped}` : 'Stopped';
   }
@@ -3773,22 +3699,6 @@ struct Index {
   }
 
   @Builder
-  diagChip(filter: string) {
-    Text(this.diagChipLabel(filter))
-      .fontSize(12)
-      .fontWeight(this.diagFilter === filter ? FontWeight.Medium : FontWeight.Normal)
-      .fontColor(this.diagFilter === filter ?
-        $r('sys.color.font_on_primary') : $r('sys.color.font_secondary'))
-      .padding({ left: 14, right: 14, top: 7, bottom: 7 })
-      .borderRadius(16)
-      .backgroundColor(this.diagFilter === filter ?
-        $r('sys.color.brand') : $r('sys.color.comp_background_primary'))
-      .onClick(() => {
-        this.diagFilter = filter;
-      })
-  }
-
-  @Builder
   diagRow(entry: DiagEntry) {
     Row({ space: 12 }) {
       Circle()
@@ -3800,7 +3710,6 @@ struct Index {
         Row() {
           Text(entry.target)
             .fontSize(15)
-            .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.font_primary'))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -3844,9 +3753,7 @@ struct Index {
         .fontColor([$r('sys.color.font_tertiary')])
     }
     .width('100%')
-    .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-    .borderRadius(12)
-    .backgroundColor($r('sys.color.comp_background_primary'))
+    .padding({ top: 12, bottom: 12 })
     .onClick(() => {
       this.openDiagnostics(entry);
     })
@@ -3854,22 +3761,10 @@ struct Index {
 
   @Builder
   logsScreen() {
-    Column({ space: 8 }) {
-      Row() {
-        Column({ space: 2 }) {
-          Text('Enable diagnostics')
-            .fontSize(15)
-            .fontColor($r('sys.color.font_primary'))
-          Text('Off by default. Records one entry per connection attempt.')
-            .fontSize(12)
-            .fontColor($r('sys.color.font_secondary'))
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.diagnosticsEnabled })
-          .selectedColor($r('sys.color.brand'))
-          .onChange((isOn: boolean) => {
+    Column({ space: 12 }) {
+      Column() {
+        toggleRow('Enable diagnostics', 'Off by default. Records one entry per connection attempt.',
+          this.diagnosticsEnabled, true, (isOn: boolean) => {
             this.diagnosticsEnabled = isOn;
             native.setDiagnostics(isOn);
             VpnSettings.setString(getContext(this) as common.Context, 'diagnostics',
@@ -3882,32 +3777,28 @@ struct Index {
             }
           })
       }
-      .width('calc(100% - 32vp)')
-      .padding(12)
-      .borderRadius(12)
+      .width('100%')
+      .padding({ left: 16, right: 16 })
+      .borderRadius(CARD_RADIUS)
       .backgroundColor($r('sys.color.comp_background_primary'))
-      .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 8 })
 
-      Column({ space: 2 }) {
-        Text(`Registered key  ${this.session?.publicKey.substring(0, 16) ?? '-'}`)
-          .fontSize(12)
-          .fontColor($r('sys.color.font_primary'))
-        Text(`Tunnel key     ${this.extensionKey.length > 0 ? this.extensionKey.substring(0, 16) : 'not loaded yet'}`)
-          .fontSize(12)
-          .fontColor(this.keyMismatch() ? $r('sys.color.alert') : $r('sys.color.font_primary'))
-        Text(`Target         ${this.relayLabel()} · phase ${this.phase}`)
-          .fontSize(12)
-          .fontColor($r('sys.color.font_primary'))
+      Column() {
+        detailRow('Registered key', this.session?.publicKey.substring(0, 16) ?? '-',
+          $r('sys.color.font_primary'))
+        rowDivider()
+        detailRow('Tunnel key', this.extensionKey.length > 0 ?
+          this.extensionKey.substring(0, 16) : 'not loaded yet',
+          this.keyMismatch() ? $r('sys.color.alert') : $r('sys.color.font_primary'))
+        rowDivider()
+        detailRow('Target', `${this.relayLabel()} · ${this.phase}`, $r('sys.color.font_primary'))
       }
-      .width('calc(100% - 32vp)')
-      .padding(12)
-      .borderRadius(12)
+      .width('100%')
+      .padding({ left: 16, right: 16 })
+      .borderRadius(CARD_RADIUS)
       .backgroundColor($r('sys.color.comp_background_primary'))
-      .alignItems(HorizontalAlign.Start)
-      .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER })
 
       Row() {
-        Text('Connection entries')
+        Text('Attempts')
           .fontSize(13)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('sys.color.font_secondary'))
@@ -3927,34 +3818,31 @@ struct Index {
           .fontSize(12)
           .fontColor($r('sys.color.font_tertiary'))
       }
-      .width('calc(100% - 32vp)')
-      .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 4 })
+      .width('100%')
+      .padding({ left: 4, right: 4 })
 
-      Scroll() {
-        Row({ space: 8 }) {
-          ForEach(this.diagFilters(), (filter: string) => {
-            this.diagChip(filter)
-          }, (filter: string) => filter)
-        }
-        .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER })
+      Row({ space: 8 }) {
+        ForEach(this.diagFilters(), (filter: string) => {
+          chip(this.diagChipLabel(filter), this.diagFilter === filter, () => {
+            this.diagFilter = filter;
+          })
+        }, (filter: string) => filter)
       }
       .width('100%')
-      .height(36)
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
 
       Scroll() {
-        Column({ space: 8 }) {
+        Column() {
           if (this.diagEntries.length === 0) {
             Text(this.diagnosticsEnabled ?
               'Nothing recorded yet. Connect once and come back.' :
               'Diagnostics are off. Turn them on, then connect.')
               .fontSize(13)
               .fontColor($r('sys.color.font_secondary'))
-              .padding(16)
+              .width('100%')
+              .padding({ top: 16, bottom: 16 })
           } else if (this.diagVisible().length === 0) {
             Column({ space: 8 }) {
-              Text(`No ${this.diagFilter} connections`)
+              Text('Nothing matches this filter.')
                 .fontSize(13)
                 .fontColor($r('sys.color.font_secondary'))
               Text('Show all')
@@ -3966,58 +3854,68 @@ struct Index {
                 })
             }
             .alignItems(HorizontalAlign.Start)
-            .padding(16)
+            .width('100%')
+            .padding({ top: 16, bottom: 16 })
           }
-          ForEach(this.diagVisible(), (entry: DiagEntry) => {
-            this.diagRow(entry)
+
+          ForEach(this.diagVisible(), (entry: DiagEntry, index: number) => {
+            Column() {
+              if (index > 0) {
+                rowDivider()
+              }
+              this.diagRow(entry)
+            }
+            .width('100%')
           }, (entry: DiagEntry) => entry.id)
         }
         .width('100%')
-        .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, bottom: 12 })
+        .padding({ left: 16, right: 16 })
+        .borderRadius(CARD_RADIUS)
+        .backgroundColor($r('sys.color.comp_background_primary'))
       }
       .layoutWeight(1)
       .width('100%')
       .scrollBar(BarState.Off)
       .align(Alignment.TopStart)
 
-      Row() {
-        Button('Check DNS')
-          .type(ButtonType.Capsule)
-          .width('100%')
-          .height(38)
-          .fontSize(14)
-          .backgroundColor($r('sys.color.comp_background_secondary'))
-          .fontColor($r('sys.color.font_secondary'))
-          .onClick(() => {
-            this.diagDnsCheck();
-          })
-      }
-      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, bottom: 4 })
-
       Row({ space: 8 }) {
-        Button('Export all (zip)')
+        Button('Check DNS')
           .type(ButtonType.Capsule)
           .layoutWeight(1)
           .height(44)
+          .fontSize(14)
+          .backgroundColor($r('sys.color.comp_background_secondary'))
+          .fontColor($r('sys.color.font_primary'))
+          .onClick(() => {
+            this.diagDnsCheck();
+          })
+        Button('Export zip')
+          .type(ButtonType.Capsule)
+          .layoutWeight(1)
+          .height(44)
+          .fontSize(14)
           .backgroundColor($r('sys.color.brand'))
           .fontColor($r('sys.color.font_on_primary'))
           .onClick(() => {
             this.diagExportZip();
           })
-        Button('Raw log')
-          .type(ButtonType.Capsule)
-          .layoutWeight(1)
-          .height(44)
-          .backgroundColor($r('sys.color.comp_background_secondary'))
-          .fontColor($r('sys.color.font_primary'))
-          .onClick(() => {
-            this.diagExportRaw();
-          })
       }
-      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, bottom: PAGE_GUTTER })
+      .width('100%')
+
+      Button('Raw log')
+        .type(ButtonType.Capsule)
+        .width('100%')
+        .height(44)
+        .fontSize(14)
+        .backgroundColor($r('sys.color.comp_background_secondary'))
+        .fontColor($r('sys.color.font_primary'))
+        .onClick(() => {
+          this.diagExportRaw();
+        })
     }
     .width('100%')
     .height('100%')
+    .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 16 })
     .onAppear(() => {
       if (this.diagnosticsEnabled) {
         this.diagStartTail();
@@ -4027,6 +3925,7 @@ struct Index {
       this.diagStopTail();
     })
   }
+
 
   @Builder
   diagDetailScreen() {
@@ -4137,10 +4036,10 @@ struct Index {
     if (days === 9999) {
       return $r('sys.color.font_secondary');
     }
-    if (days < 0 || days <= 7) {
+    if (days <= 7) {
       return $r('sys.color.alert');
     }
-    if (days <= 14) {
+    if (days <= 30) {
       return $r('sys.color.font_secondary');
     }
     return $r('sys.color.confirm');
@@ -4163,16 +4062,11 @@ struct Index {
     return `Your account expires in ${days} ${days === 1 ? 'day' : 'days'}`;
   }
 
-  /** Confirmation for icon-only copy actions; without it the tap feels like nothing. */
-  private acctToast(message: string): void {
-    promptAction.showToast({ message: message, duration: 1600 });
-  }
-
   /** Mullvad device management folded into Account; the `devices` destination stays for deep links. */
   @Builder
   accountScreen() {
     Scroll() {
-      Column() {
+      Column({ space: 16 }) {
         if (this.acctShouldWarn()) {
           Column({ space: 10 }) {
             Row({ space: 8 }) {
@@ -4198,10 +4092,9 @@ struct Index {
                 this.copyAccount();
               })
           }
-          .width('calc(100% - 32vp)')
+          .width('100%')
           .padding(16)
           .alignItems(HorizontalAlign.Start)
-          .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12 })
           .borderRadius(CARD_RADIUS)
           .border({ width: 1, color: $r('sys.color.alert') })
           .backgroundColor($r('sys.color.comp_background_primary'))
@@ -4213,7 +4106,8 @@ struct Index {
               .fontSize(15)
               .fontColor($r('sys.color.font_primary'))
             Blank()
-            Text(this.revealAccount ? (this.session?.account ?? '') : maskAccount(this.session?.account ?? ''))
+            Text(this.revealAccount ? (this.session?.account ?? '') :
+              maskAccount(this.session?.account ?? ''))
               .fontSize(15)
               .fontColor($r('sys.color.font_secondary'))
             Row() {
@@ -4243,7 +4137,7 @@ struct Index {
           .width('100%')
           .height(52)
 
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+          rowDivider()
 
           Row() {
             Text('Expires')
@@ -4265,7 +4159,7 @@ struct Index {
           .width('100%')
           .height(52)
 
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+          rowDivider()
 
           Row() {
             Text('This device')
@@ -4279,9 +4173,8 @@ struct Index {
           .width('100%')
           .height(44)
         }
-        .width('calc(100% - 32vp)')
+        .width('100%')
         .padding({ left: 16, right: 16 })
-        .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12 })
         .borderRadius(CARD_RADIUS)
         .backgroundColor($r('sys.color.comp_background_primary'))
 
@@ -4289,21 +4182,23 @@ struct Index {
           Row() {
             Text('Devices')
               .fontSize(15)
-              .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_primary'))
             Blank()
-            Text(this.acctEditDevices ? 'Done' : 'Manage')
-              .fontSize(14)
-              .fontWeight(FontWeight.Medium)
+            Button(this.acctEditDevices ? 'Done' : 'Manage')
+              .type(ButtonType.Capsule)
+              .height(32)
+              .padding({ left: 14, right: 14 })
+              .fontSize(13)
+              .backgroundColor($r('sys.color.comp_background_secondary'))
               .fontColor($r('sys.color.brand'))
               .onClick(() => {
                 this.acctEditDevices = !this.acctEditDevices;
               })
           }
           .width('100%')
-          .height(48)
+          .height(52)
 
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+          rowDivider()
 
           if (this.devicesError.length > 0) {
             Text(this.devicesError)
@@ -4314,24 +4209,38 @@ struct Index {
           }
 
           if (this.devices.length === 0 && !this.devicesBusy) {
-            Text('No devices on this account yet.')
-              .fontSize(12)
-              .fontColor($r('sys.color.font_tertiary'))
-              .width('100%')
-              .padding({ top: 12, bottom: 12 })
+            Column({ space: 10 }) {
+              Text('No devices on this account yet.')
+                .fontSize(13)
+                .fontColor($r('sys.color.font_secondary'))
+              Button('Refresh')
+                .type(ButtonType.Capsule)
+                .height(36)
+                .padding({ left: 16, right: 16 })
+                .fontSize(13)
+                .backgroundColor($r('sys.color.comp_background_secondary'))
+                .fontColor($r('sys.color.font_primary'))
+                .onClick(() => {
+                  this.loadDevices();
+                })
+            }
+            .width('100%')
+            .alignItems(HorizontalAlign.Start)
+            .padding({ top: 12, bottom: 12 })
           }
 
           ForEach(this.devices, (device: DeviceResponse, index: number) => {
             Column() {
               if (index > 0) {
-                Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+                rowDivider()
               }
               Row() {
                 Column({ space: 2 }) {
                   Text(device.name)
-                    .fontSize(14)
-                    .fontWeight(FontWeight.Medium)
+                    .fontSize(15)
                     .fontColor($r('sys.color.font_primary'))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
                   Text(`${device.ipv4_address} · added ${formatDate(device.created)}`)
                     .fontSize(12)
                     .fontColor($r('sys.color.font_secondary'))
@@ -4344,58 +4253,54 @@ struct Index {
                     .width(24)
                     .height(24)
                     .color($r('sys.color.brand'))
-                } else if (this.acctEditDevices) {
-                  Button() {
-                    Text('Remove')
-                      .fontSize(13)
-                      .fontColor($r('sys.color.alert'))
-                  }
-                  .type(ButtonType.Capsule)
-                  .height(32)
-                  .padding({ left: 14, right: 14 })
-                  .backgroundColor($r('sys.color.comp_background_secondary'))
-                  .onClick(() => {
-                    this.confirmRemove(device);
-                  })
+                } else if (this.acctEditDevices && device.id !== this.session?.deviceId) {
+                  Button('Remove')
+                    .type(ButtonType.Capsule)
+                    .height(32)
+                    .padding({ left: 14, right: 14 })
+                    .fontSize(13)
+                    .backgroundColor($r('sys.color.comp_background_secondary'))
+                    .fontColor($r('sys.color.alert'))
+                    .onClick(() => {
+                      this.confirmRemove(device);
+                    })
                 } else if (device.id === this.session?.deviceId) {
-                  Text('This tablet')
+                  Text('This device')
                     .fontSize(12)
                     .fontColor($r('sys.color.brand'))
                 }
               }
               .width('100%')
-              .padding({ top: 10, bottom: 10 })
+              .padding({ top: 12, bottom: 12 })
             }
             .width('100%')
           }, (device: DeviceResponse) => device.id)
         }
-        .width('calc(100% - 32vp)')
-        .padding({ left: 16, right: 16, top: 4, bottom: 4 })
-        .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12 })
+        .width('100%')
+        .padding({ left: 16, right: 16 })
         .borderRadius(CARD_RADIUS)
         .backgroundColor($r('sys.color.comp_background_primary'))
 
-        Row() {
-          Button('Sign out')
-            .type(ButtonType.Capsule)
-            .width('100%')
-            .height(48)
-            .backgroundColor($r('sys.color.comp_background_primary'))
-            .fontColor($r('sys.color.alert'))
-            .onClick(() => {
-              this.signOut();
-              this.pageStack.clear();
-            })
-        }
-        .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 16, bottom: 24 })
+        Button('Sign out')
+          .type(ButtonType.Capsule)
+          .width('100%')
+          .height(48)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .fontColor($r('sys.color.alert'))
+          .onClick(() => {
+            this.signOut();
+          })
       }
       .width('100%')
+      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 24 })
     }
     .width('100%')
     .height('100%')
     .align(Alignment.TopStart)
     .scrollBar(BarState.Off)
   }
+
+
 
   // ---------------------------------------------------------------- settings
 
@@ -4564,148 +4469,94 @@ struct Index {
     .opacity(this.prefs.dnsMode === 'auto' ? 1 : 0.5)
   }
 
-  /** Copies the last diagnostics text the tunnel wrote; Settings only reads it. */
-  private setCopyDiagnostics(): void {
-    const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.logText);
-    pasteboard.getSystemPasteboard().setData(data).catch((err: BusinessError) => {
-      hilog.warn(DOMAIN, TAG, 'clipboard failed %{public}d', err.code);
-    });
-  }
-
+  /**
+   * Resolver only: automatic via the tunnel, or a custom list. Content blocking has its
+   * own screen because six switches do not belong under a radio pair.
+   */
   @Builder
   dnsScreen() {
     Scroll() {
-      Column({ space: 12 }) {
-        Column({ space: 8 }) {
-        Column({ space: 8 }) {
-          Text('DNS')
-            .fontSize(15)
-            .fontColor($r('sys.color.font_primary'))
+      Column({ space: 16 }) {
+        Column() {
+          groupTitle('Resolver')
+          Column({ space: 10 }) {
+            segmented(this.setDnsModes(), ['Automatic', 'Custom'], this.prefs.dnsMode,
+              (mode: string) => {
+                this.setDnsMode(mode as DnsMode);
+              })
+            Text(this.setDnsHint())
+              .fontSize(12)
+              .fontColor($r('sys.color.font_secondary'))
+              .width('100%')
 
-          Row({ space: 4 }) {
-            ForEach(this.setDnsModes(), (mode: DnsMode) => {
-              Button(this.setDnsName(mode))
-                .type(ButtonType.Normal)
-                .layoutWeight(1)
-                .height(34)
-                .borderRadius(8)
-                .fontSize(11)
-                .padding({ left: 0, right: 0 })
-                .backgroundColor(this.prefs.dnsMode === mode ?
-                  $r('sys.color.brand') : Color.Transparent)
-                .fontColor(this.prefs.dnsMode === mode ?
-                  Color.White : $r('sys.color.font_secondary'))
-                .onClick(() => {
-                  this.setDnsMode(mode);
-                })
-            }, (mode: DnsMode) => mode)
-          }
-          .width('100%')
-          .padding(3)
-          .borderRadius(10)
-          .backgroundColor($r('sys.color.comp_background_secondary'))
+            if (this.prefs.dnsMode === 'custom') {
+              ForEach(this.prefs.customDns, (address: string) => {
+                Row() {
+                  Text(address)
+                    .fontSize(15)
+                    .fontColor($r('sys.color.font_primary'))
+                    .layoutWeight(1)
+                  Button('Remove')
+                    .type(ButtonType.Capsule)
+                    .height(28)
+                    .fontSize(12)
+                    .padding({ left: 12, right: 12 })
+                    .backgroundColor($r('sys.color.comp_background_secondary'))
+                    .fontColor($r('sys.color.alert'))
+                    .onClick(() => {
+                      this.setRemoveDns(address);
+                    })
+                }
+                .width('100%')
+                .height(40)
+              }, (address: string) => address)
 
-          Text(this.setDnsHint())
-            .fontSize(12)
-            .fontColor($r('sys.color.font_secondary'))
-            .width('100%')
-
-          if (this.prefs.dnsMode === 'custom') {
-            ForEach(this.prefs.customDns, (address: string) => {
-              Row() {
-                Text(address)
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
+              Row({ space: 8 }) {
+                TextInput({ placeholder: 'IPv4 or IPv6 address', text: this.dnsInput })
                   .layoutWeight(1)
-                Button('Remove')
-                  .type(ButtonType.Capsule)
-                  .height(28)
-                  .fontSize(12)
-                  .padding({ left: 12, right: 12 })
+                  .height(38)
+                  .fontSize(14)
                   .backgroundColor($r('sys.color.comp_background_secondary'))
-                  .fontColor($r('sys.color.alert'))
+                  .borderRadius(8)
+                  .placeholderColor($r('sys.color.font_tertiary'))
+                  .caretColor($r('sys.color.brand'))
+                  .onChange((value: string) => {
+                    this.dnsInput = value;
+                    this.dnsError = '';
+                  })
+                Button('Add')
+                  .type(ButtonType.Capsule)
+                  .height(38)
+                  .fontSize(14)
+                  .padding({ left: 18, right: 18 })
+                  .backgroundColor($r('sys.color.brand'))
+                  .fontColor(Color.White)
                   .onClick(() => {
-                    this.setRemoveDns(address);
+                    this.setAddDns();
                   })
               }
               .width('100%')
-              .height(40)
-            }, (address: string) => address)
 
-            Row({ space: 8 }) {
-              TextInput({ placeholder: 'IPv4 or IPv6 address', text: this.dnsInput })
-                .layoutWeight(1)
-                .height(38)
-                .fontSize(14)
-                .backgroundColor($r('sys.color.comp_background_secondary'))
-                .borderRadius(8)
-                .placeholderColor($r('sys.color.font_tertiary'))
-                .caretColor($r('sys.color.brand'))
-                .onChange((value: string) => {
-                  this.dnsInput = value;
-                  this.dnsError = '';
-                })
-              Button('Add')
-                .type(ButtonType.Capsule)
-                .height(38)
-                .fontSize(14)
-                .padding({ left: 18, right: 18 })
-                .backgroundColor($r('sys.color.brand'))
-                .fontColor(Color.White)
-                .onClick(() => {
-                  this.setAddDns();
-                })
-            }
-            .width('100%')
-
-            if (this.dnsError.length > 0) {
-              Text(this.dnsError)
-                .fontSize(12)
-                .fontColor($r('sys.color.alert'))
-                .width('100%')
+              if (this.dnsError.length > 0) {
+                Text(this.dnsError)
+                  .fontSize(12)
+                  .fontColor($r('sys.color.alert'))
+                  .width('100%')
+              }
             }
           }
+          .width('100%')
+          .padding(16)
+          .borderRadius(CARD_RADIUS)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .alignItems(HorizontalAlign.Start)
         }
         .width('100%')
-        .padding({ top: 12, bottom: 12 })
-        .alignItems(HorizontalAlign.Start)
-
-        Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-        Column({ space: 4 }) {
-          Text('Content blocking')
-            .fontSize(15)
-            .fontColor($r('sys.color.font_primary'))
-          Text(this.setBlockHint())
-            .fontSize(12)
-            .fontColor($r('sys.color.font_secondary'))
-            .width('100%')
-            .margin({ bottom: 4 })
-
-          this.blockRow('Ads', 'blockAds')
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-          this.blockRow('Trackers', 'blockTrackers')
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-          this.blockRow('Malware', 'blockMalware')
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-          this.blockRow('Adult content', 'blockAdult')
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-          this.blockRow('Gambling', 'blockGambling')
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-          this.blockRow('Social media', 'blockSocial')
-        }
-        .width('100%')
-        .padding({ top: 12, bottom: 6 })
-        .alignItems(HorizontalAlign.Start)
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
-        .borderRadius(CARD_RADIUS)
-        .backgroundColor($r('sys.color.comp_background_primary'))
         .alignItems(HorizontalAlign.Start)
       }
-      .width('calc(100% - 32vp)')
-      .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12 })
+      .width('100%')
+      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 24 })
+      .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
     .height('100%')
@@ -4713,381 +4564,288 @@ struct Index {
     .align(Alignment.TopStart)
   }
 
+  /** The six blocking categories; they only take effect with automatic DNS. */
   @Builder
-  settingsScreen() {
+  blockingScreen() {
     Scroll() {
-      Column() {
-        if (this.settingsReady) {
+      Column({ space: 16 }) {
+        Column() {
+          groupTitle('Categories')
           Column() {
-            Column({ space: 8 }) {
-              Text('Protocol preference')
-                .fontSize(15)
-                .fontColor($r('sys.color.font_primary'))
-
-              Row({ space: 4 }) {
-                ForEach(this.setProtocolModes(), (mode: string) => {
-                  Button(this.setProtocolName(mode))
-                    .type(ButtonType.Normal)
-                    .layoutWeight(1)
-                    .height(34)
-                    .borderRadius(8)
-                    .fontSize(11)
-                    .padding({ left: 0, right: 0 })
-                    .backgroundColor(this.protocolMode === mode ?
-                      $r('sys.color.brand') : Color.Transparent)
-                    .fontColor(this.protocolMode === mode ?
-                      Color.White : $r('sys.color.font_secondary'))
-                    .onClick(() => {
-                      this.setProtocolMode(mode);
-                    })
-                }, (mode: string) => mode)
-              }
-              .width('100%')
-              .padding(3)
-              .borderRadius(10)
-              .backgroundColor($r('sys.color.comp_background_secondary'))
-
-              Text(this.setProtocolHint())
-                .fontSize(12)
-                .fontColor($r('sys.color.font_secondary'))
-                .width('100%')
-            }
-            .width('100%')
-            .padding({ top: 12, bottom: 12 })
-            .alignItems(HorizontalAlign.Start)
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Row() {
-              Column({ space: 2 }) {
-                Text('Kill switch')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text('Blocks all traffic whenever the tunnel is down.')
-                  .fontSize(12)
-                  .fontColor($r('sys.color.font_secondary'))
-                if (!this.prefs.killSwitch) {
-                  Text('Your traffic is unprotected when the VPN drops.')
-                    .fontSize(12)
-                    .fontColor($r('sys.color.font_tertiary'))
-                }
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-
-              Toggle({ type: ToggleType.Switch, isOn: this.prefs.killSwitch })
-                .selectedColor($r('sys.color.brand'))
-                .onChange((isOn: boolean) => {
-                  this.prefs.killSwitch = isOn;
-                  this.setPref('killSwitch', isOn);
-                })
-            }
-            .width('100%')
-            .padding({ top: 10, bottom: 10 })
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Column({ space: 8 }) {
-              Column({ space: 2 }) {
-                Text('Device IP version')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text('The other family is dropped inside the tunnel and blocked on the carrier')
-                  .fontSize(12)
-                  .fontColor($r('sys.color.font_secondary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .width('100%')
-
-              Row({ space: 8 }) {
-                this.ipOption('IPv4 only', 'ipv4')
-                this.ipOption('IPv6 only', 'ipv6')
-                this.ipOption('Both', 'auto')
-              }
-              .width('100%')
-            }
-            .width('100%')
-            .padding({ top: 12, bottom: 12 })
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Row() {
-              Column({ space: 2 }) {
-                Text('DNS')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text(this.dnsSummary())
-                  .fontSize(12)
-                  .fontColor($r('sys.color.font_secondary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-
-              SymbolGlyph($r('sys.symbol.chevron_right'))
-                .fontSize(16)
-                .fontColor([$r('sys.color.font_tertiary')])
-            }
-            .width('100%')
-            .height(60)
-            .onClick(() => {
-              this.pageStack.pushPath({ name: 'dns' });
-            })
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Row() {
-              Column({ space: 2 }) {
-                Text('Direct connection')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text('Off keeps api.mullvad.net out of DNS and TLS SNI; everything goes through the CDN tunnel')
-                  .fontSize(12)
-                  .fontColor($r('sys.color.font_secondary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-
-              Toggle({ type: ToggleType.Switch, isOn: this.prefs.directAllowed })
-                .selectedColor($r('sys.color.brand'))
-                .onChange((isOn: boolean) => {
-                  this.prefs.directAllowed = isOn;
-                  native.setDirectAllowed(isOn);
-                  this.setPref('directAllowed', isOn);
-                })
-            }
-            .width('100%')
-            .height(60)
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Row() {
-              Column({ space: 2 }) {
-                Text('Relay socket')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text(this.protectedFd >= 0 ? `protected · fd ${this.protectedFd}` :
-                  'bypasses the tunnel through the app exclusion')
-                  .fontSize(12)
-                  .fontColor($r('sys.color.brand'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-            }
-            .width('100%')
-            .height(60)
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Row() {
-              Column({ space: 2 }) {
-                Text('Diagnostics')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text('Tunnel log, device keys, what the client is pointed at')
-                  .fontSize(12)
-                  .fontColor($r('sys.color.font_secondary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-
-              SymbolGlyph($r('sys.symbol.chevron_right'))
-                .fontSize(16)
-                .fontColor([$r('sys.color.font_tertiary')])
-            }
-            .width('100%')
-            .height(60)
-            .onClick(() => {
-              this.readLogs();
-              this.diagStartTail();
-              this.pageStack.pushPath({ name: 'logs' });
-            })
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Row() {
-              Column({ space: 2 }) {
-                Text('About')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text('Client, not a service · not endorsed by Mullvad')
-                  .fontSize(12)
-                  .fontColor($r('sys.color.font_secondary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-
-              SymbolGlyph($r('sys.symbol.chevron_right'))
-                .fontSize(16)
-                .fontColor([$r('sys.color.font_tertiary')])
-            }
-            .width('100%')
-            .height(60)
-            .onClick(() => {
-              this.pageStack.pushPath({ name: 'about' });
-            })
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Row() {
-              Column({ space: 2 }) {
-                Text('DAITA')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text('Only use relays that defend against AI-guided traffic analysis')
-                  .fontSize(12)
-                  .fontColor($r('sys.color.font_secondary'))
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-
-              Toggle({ type: ToggleType.Switch, isOn: this.prefs.daita })
-                .selectedColor($r('sys.color.brand'))
-                .onChange((isOn: boolean) => {
-                  this.prefs.daita = isOn;
-                  this.setPref('daita', isOn);
-                  // The list is filtered by this, so drop a selection that no longer fits.
-                  if (isOn && this.selection !== null) {
-                    this.relays = this.relays.filter((relay: RelayItem) => relay.daita);
-                  }
-                })
-            }
-            .width('100%')
-            .height(60)
-
-            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-            Row() {
-              Column({ space: 2 }) {
-                Text('Multihop')
-                  .fontSize(15)
-                  .fontColor($r('sys.color.font_primary'))
-                Text(!this.prefs.multihop ?
-                  'Send traffic through an entry relay, then a separate exit relay' :
-                  (this.exitSelection === null ? 'On · choose an exit relay' :
-                    `Exit ${this.exitLabel()}`))
-                  .fontSize(12)
-                  .fontColor($r('sys.color.font_secondary'))
-                  .maxLines(2)
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
-
-              Toggle({ type: ToggleType.Switch, isOn: this.prefs.multihop })
-                .selectedColor($r('sys.color.brand'))
-                .onChange((isOn: boolean) => {
-                  this.prefs.multihop = isOn;
-                  this.setPref('multihop', isOn);
-                })
-            }
-            .width('100%')
-            .padding({ top: 10, bottom: 10 })
-
-            if (this.prefs.multihop) {
-              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-              Row() {
-                Column({ space: 2 }) {
-                  Text('Exit relay')
-                    .fontSize(15)
-                    .fontColor($r('sys.color.font_primary'))
-                  Text(this.exitSelection === null ?
-                    'Not selected · traffic still leaves through the entry relay' :
-                    `${this.exitSelection.hostname} · ${this.exitLabel()}`)
-                    .fontSize(12)
-                    .fontColor(this.exitSelection === null ?
-                      $r('sys.color.font_tertiary') : $r('sys.color.font_secondary'))
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                }
-                .alignItems(HorizontalAlign.Start)
-                .layoutWeight(1)
-
-                SymbolGlyph($r('sys.symbol.chevron_right'))
-                  .fontSize(16)
-                  .fontColor([$r('sys.color.font_tertiary')])
-              }
-              .width('100%')
-              .height(60)
-              .onClick(() => {
-                this.openServers('exit');
+            toggleRow('Ads', '', this.prefs.blockAds, this.prefs.dnsMode === 'auto',
+              (value: boolean) => {
+                this.setBlock('blockAds', value);
               })
-            }
+            rowDivider()
+            toggleRow('Trackers', '', this.prefs.blockTrackers, this.prefs.dnsMode === 'auto',
+              (value: boolean) => {
+                this.setBlock('blockTrackers', value);
+              })
+            rowDivider()
+            toggleRow('Malware', '', this.prefs.blockMalware, this.prefs.dnsMode === 'auto',
+              (value: boolean) => {
+                this.setBlock('blockMalware', value);
+              })
+            rowDivider()
+            toggleRow('Adult content', '', this.prefs.blockAdult, this.prefs.dnsMode === 'auto',
+              (value: boolean) => {
+                this.setBlock('blockAdult', value);
+              })
+            rowDivider()
+            toggleRow('Gambling', '', this.prefs.blockGambling, this.prefs.dnsMode === 'auto',
+              (value: boolean) => {
+                this.setBlock('blockGambling', value);
+              })
+            rowDivider()
+            toggleRow('Social media', '', this.prefs.blockSocial, this.prefs.dnsMode === 'auto',
+              (value: boolean) => {
+                this.setBlock('blockSocial', value);
+              })
           }
-          .width('calc(100% - 32vp)')
+          .width('100%')
           .padding({ left: 16, right: 16 })
           .borderRadius(CARD_RADIUS)
           .backgroundColor($r('sys.color.comp_background_primary'))
-          .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12 })
         }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
 
-        Column() {
-          Row() {
-            Text('燕鸥')
-              .fontSize(15)
-              .fontColor($r('sys.color.font_primary'))
-            Blank()
-            Text('0.1.0')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-          }
+        Text(this.setBlockHint())
+          .fontSize(12)
+          .fontColor($r('sys.color.font_secondary'))
           .width('100%')
-          .height(44)
-
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-          Row() {
-            Text('License')
-              .fontSize(15)
-              .fontColor($r('sys.color.font_primary'))
-            Blank()
-            Text('GPL-3.0-or-later')
-              .fontSize(14)
-              .fontColor($r('sys.color.font_secondary'))
-          }
-          .width('100%')
-          .height(44)
-
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-          Text("Based on Mullvad's client (mullvadvpn-app)")
-            .fontSize(12)
-            .fontColor($r('sys.color.font_secondary'))
-            .width('100%')
-            .padding({ top: 10, bottom: 10 })
-
-          Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
-
-          Button('Copy diagnostics')
-            .type(ButtonType.Capsule)
-            .width('100%')
-            .height(38)
-            .fontSize(14)
-            .backgroundColor($r('sys.color.comp_background_secondary'))
-            .fontColor($r('sys.color.brand'))
-            .margin({ top: 12, bottom: 12 })
-            .onClick(() => {
-              this.setCopyDiagnostics();
-            })
-        }
-        .width('calc(100% - 32vp)')
-        .padding({ left: 16, right: 16 })
-        .borderRadius(CARD_RADIUS)
-        .backgroundColor($r('sys.color.comp_background_primary'))
-        .margin({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12 })
+          .padding({ left: 4, right: 4 })
       }
       .width('100%')
-      .padding({ bottom: 24 })
+      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 24 })
+      .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
     .height('100%')
-    .align(Alignment.TopStart)
     .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
+  }
+
+  /** Protocol preference and IP version: the two choices that change what gets dialled. */
+  @Builder
+  connectionScreen() {
+    Scroll() {
+      Column({ space: 16 }) {
+        Column() {
+          groupTitle('Protocol')
+          Column({ space: 10 }) {
+            segmented(this.setProtocolModes(), ['Auto', 'WireGuard', 'Obfuscated'],
+              this.protocolMode, (mode: string) => {
+                this.setProtocolMode(mode);
+              })
+            Text(this.setProtocolHint())
+              .fontSize(12)
+              .fontColor($r('sys.color.font_secondary'))
+              .width('100%')
+          }
+          .width('100%')
+          .padding(16)
+          .borderRadius(CARD_RADIUS)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        Column() {
+          groupTitle('Device IP version')
+          Column({ space: 10 }) {
+            segmented(['ipv4', 'ipv6', 'auto'], ['IPv4', 'IPv6', 'Both'],
+              this.prefs.ipVersion, (version: string) => {
+                this.prefs.ipVersion = version;
+                this.setPrefText('ipVersion', version);
+              })
+            Text('The other family is dropped inside the tunnel and blocked on the carrier.')
+              .fontSize(12)
+              .fontColor($r('sys.color.font_secondary'))
+              .width('100%')
+          }
+          .width('100%')
+          .padding(16)
+          .borderRadius(CARD_RADIUS)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width('100%')
+      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 24 })
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
     .onAppear(() => {
       this.setLoadProtocolMode();
     })
   }
 
+
+  /**
+   * The index of every setting: one row per decision, and the rows that need more than a
+   * switch open their own screen. Nothing here repeats a value another row already shows.
+   */
+  @Builder
+  settingsScreen() {
+    Scroll() {
+      Column({ space: 16 }) {
+        Column() {
+          groupTitle('Connection')
+          Column() {
+            navRow('Servers', this.relayLabel(), false, () => {
+              this.openServers();
+            })
+            // Only meaningful with multihop on, so it is not shown otherwise.
+            if (this.prefs.multihop) {
+              rowDivider()
+              navRow('Exit relay', this.exitSelection === null ? 'Not selected' : this.exitLabel(),
+                this.exitSelection !== null, () => {
+                  this.openServers('exit');
+                })
+            }
+            rowDivider()
+            navRow('Protocol', this.setProtocolName(this.protocolMode), false, () => {
+              this.pageStack.pushPath({ name: 'connection' });
+            })
+            rowDivider()
+            navRow('Device IP version', this.ipModeLabel(), false, () => {
+              this.pageStack.pushPath({ name: 'connection' });
+            })
+            rowDivider()
+            toggleRow('Multihop', 'Entry relay, then a separate exit relay',
+              this.prefs.multihop, true, (value: boolean) => {
+                this.prefs.multihop = value;
+                this.setPref('multihop', value);
+              })
+            rowDivider()
+            toggleRow('Kill switch', 'Block all traffic whenever the tunnel is down',
+              this.prefs.killSwitch, true, (value: boolean) => {
+                this.prefs.killSwitch = value;
+                this.setPref('killSwitch', value);
+              })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .borderRadius(CARD_RADIUS)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        Column() {
+          groupTitle('DNS')
+          Column() {
+            navRow('Resolver', this.dnsSummary(), false, () => {
+              this.pageStack.pushPath({ name: 'dns' });
+            })
+            rowDivider()
+            navRow('Content blocking', this.blockingSummary(),
+              this.prefs.dnsMode === 'auto' && this.blockCount() > 0, () => {
+                this.pageStack.pushPath({ name: 'blocking' });
+              })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .borderRadius(CARD_RADIUS)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        Column() {
+          groupTitle('Privacy')
+          Column() {
+            toggleRow('DAITA', 'Only use relays that resist AI-guided traffic analysis',
+              this.prefs.daita, true, (value: boolean) => {
+                this.prefs.daita = value;
+                this.setPref('daita', value);
+                // The cache holds only DAITA relays while this is on; turning it off needs a
+                // refetch, otherwise the list stays narrowed until the next launch.
+                this.refreshRelays();
+              })
+            rowDivider()
+            toggleRow('Direct connection', 'Off keeps api.mullvad.net out of DNS and TLS SNI',
+              this.prefs.directAllowed, true, (value: boolean) => {
+                this.prefs.directAllowed = value;
+                native.setDirectAllowed(value);
+                this.setPref('directAllowed', value);
+              })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .borderRadius(CARD_RADIUS)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        Column() {
+          groupTitle('App')
+          Column() {
+            navRow('Diagnostics', '', false, () => {
+              this.readLogs();
+              this.diagStartTail();
+              this.pageStack.pushPath({ name: 'logs' });
+            })
+            rowDivider()
+            navRow('About', APP_VERSION, false, () => {
+              this.pageStack.pushPath({ name: 'about' });
+            })
+            rowDivider()
+            navRow('Account', this.accountValue(), false, () => {
+              this.revealAccount = false;
+              this.acctEditDevices = false;
+              this.loadAccountExpiry();
+              this.loadDevices();
+              this.pageStack.pushPath({ name: 'account' });
+            })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16 })
+          .borderRadius(CARD_RADIUS)
+          .backgroundColor($r('sys.color.comp_background_primary'))
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width('100%')
+      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 24 })
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
+  }
+
+
   // ---------------------------------------------------------------- host
+
+  /** Title the navigation bar shows for each destination. */
+  private pageTitle(name: string): string {
+    if (name === 'servers') {
+      return this.serverMode === 'exit' ? 'Exit relay' : 'Servers';
+    }
+    const titles: Record<string, string> = {
+      'devices': 'Devices',
+      'logs': 'Diagnostics',
+      'entry': 'Attempt',
+      'account': 'Account',
+      'settings': 'Settings',
+      'dns': 'DNS',
+      'blocking': 'Content blocking',
+      'connection': 'Connection',
+      'about': 'About'
+    };
+    return titles[name] ?? 'Settings';
+  }
 
   @Builder
   pageMap(name: string) {
@@ -5108,6 +4866,10 @@ struct Index {
             this.settingsScreen()
           } else if (name === 'dns') {
             this.dnsScreen()
+          } else if (name === 'blocking') {
+            this.blockingScreen()
+          } else if (name === 'connection') {
+            this.connectionScreen()
           } else if (name === 'about') {
             this.aboutScreen()
           }
@@ -5121,12 +4883,7 @@ struct Index {
       .justifyContent(FlexAlign.Center)
       .alignItems(VerticalAlign.Top)
     }
-    .title(name === 'devices' ? 'Devices' :
-      (name === 'servers' ? (this.serverMode === 'exit' ? 'Exit relay' : 'Servers') :
-        (name === 'logs' ? 'Diagnostics' :
-          (name === 'entry' ? 'Connection' :
-            (name === 'account' ? 'Account' :
-              (name === 'about' ? 'About' : (name === 'dns' ? 'DNS' : 'VPN settings')))))))
+    .title(this.pageTitle(name))
     .backgroundColor($r('sys.color.background_secondary'))
   }
 
