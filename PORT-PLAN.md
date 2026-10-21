@@ -345,6 +345,12 @@ device.
 
 Sizes are relative (S, M, L, XL), not durations, per the rule at the top of this file.
 
+**Status:** U0–U6 are implemented and merged into `main`; the units were built in parallel
+worktrees and integrated one at a time. Device verification is still open — the exit criteria
+below marked "on device" have not all been run on the tablet yet. `main` builds, and the Rust
+core carries 41 unit tests covering LWO and udp2tcp framing, multihop MTU and settings, and
+the DAITA protobuf/gRPC exchange.
+
 | Unit | Contains | Depends on | Parallel with | Size |
 |---|---|---|---|---|
 | **U0 Contract** | relay fields, transport trait, data-driven ladder | none | U1, U4 | S |
