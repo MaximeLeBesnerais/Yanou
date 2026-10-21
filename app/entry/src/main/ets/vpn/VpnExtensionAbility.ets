@@ -19,7 +19,22 @@ const TAG = 'YanouVpn';
  */
 const TUN_GATEWAY: string = '10.64.0.1';
 const TUN_DNS: string = '10.64.0.1';
+/** Base tun MTU: what a single-hop tunnel uses. */
 const TUN_MTU: number = 1420;
+/**
+ * Port an exit relay accepts multihop connections on. It is fixed by Mullvad and is not
+ * derived from the port the entry attempt uses (upstream `WIREGUARD_EXIT_PORT`).
+ */
+const EXIT_PORT: number = 51820;
+/** A multihop tunnel never goes below this: IPv6 stops working underneath. */
+const MIN_MULTIHOP_MTU: number = 1280;
+/**
+ * Bytes the second WireGuard header adds to every payload packet: outer IP, UDP and the
+ * WireGuard data header with its tag, matching `Ipv4Header::LEN + UdpHeader::LEN +
+ * WgData::OVERHEAD` in the core.
+ */
+const EXIT_IPV4_OVERHEAD: number = 60;
+const EXIT_IPV6_OVERHEAD: number = 80;
 /**
  * Ports to try against a relay, in order.
  *
@@ -118,6 +133,14 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
   private target: string = '';
   private relayIp: string = '';
   private relayKey: string = '';
+  /**
+   * Multihop exit relay, forwarded by the UI in the Want. Empty when multihop is off or
+   * no exit has been selected yet: that is a single-hop connection.
+   */
+  private exitHostname: string = '';
+  private exitIpv4: string = '';
+  private exitIpv6: string = '';
+  private exitKey: string = '';
   private candidates: RelayCandidate[] = [];
   private candidateIndex: number = 0;
   private attemptStartedAt: number = 0;
@@ -169,6 +192,14 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       params['ipVersion'] as string : 'ipv4';
     this.expectKey = params !== undefined && params['expectKey'] !== undefined ?
       params['expectKey'] as string : '';
+    this.exitHostname = params !== undefined && params['exitHostname'] !== undefined ?
+      params['exitHostname'] as string : '';
+    this.exitIpv4 = params !== undefined && params['exitIpv4'] !== undefined ?
+      params['exitIpv4'] as string : '';
+    this.exitIpv6 = params !== undefined && params['exitIpv6'] !== undefined ?
+      params['exitIpv6'] as string : '';
+    this.exitKey = params !== undefined && params['exitKey'] !== undefined ?
+      params['exitKey'] as string : '';
     const diagnostics: boolean = params !== undefined && params['diagnostics'] !== undefined ?
       params['diagnostics'] as boolean : false;
     const raw: string = params !== undefined && params['relayCandidates'] !== undefined ?
@@ -268,12 +299,15 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         hilog.info(DOMAIN, TAG, 'ipv6 %{public}s', ipv6Cidr);
       }
 
+      // Multihop spends a second WireGuard header on top of the tunnel. The vNIC has to
+      // advertise the smaller MTU, or large packets will stall on a tunnel that looks up.
+      const mtu: number = this.effectiveMtu();
       this.connection = vpnExtension.createVpnConnection(this.context);
       const config: vpnExtension.VpnConfig = {
         addresses: addresses,
         routes: routes,
         dnsAddresses: [TUN_DNS],
-        mtu: TUN_MTU,
+        mtu: mtu,
         isIPv4Accepted: true,
         isIPv6Accepted: ipv6Cidr.length > 0,
         // IPv4-only is a promise, not a preference: the family that is not forwarded has to
@@ -285,11 +319,19 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
 
       this.tunnelFd = await this.connection.create(config);
       hilog.info(DOMAIN, TAG, 'tun fd=%{public}d', this.tunnelFd);
-      native.logLine(`vpn config: tun fd ${this.tunnelFd} · mtu ${TUN_MTU} · dns ${TUN_DNS} · ` +
+      native.logLine(`vpn config: tun fd ${this.tunnelFd} · mtu ${mtu} · dns ${TUN_DNS} · ` +
         `ipv6 ${ipv6Cidr.length > 0 ? ipv6Cidr : 'off'} · families ${this.ipVersion} · ` +
         `killSwitch ${killSwitch} · ` +
         `own traffic goes through the tunnel (protect() covers the engine socket)`);
       native.logLine(`candidates: ${this.candidates.length} from ${this.target}`);
+      if (this.multihop()) {
+        native.logLine(`multihop: exit ` +
+          `${this.exitHostname.length > 0 ? `${this.exitHostname} ` : ''}` +
+          `${this.exitEndpointIp()}:${EXIT_PORT} · mtu ${TUN_MTU} - ${this.exitOverhead()} B ` +
+          `second header = ${mtu}`);
+      } else if (this.exitKey.length > 0) {
+        native.logLine('multihop: exit relay has no endpoint address; connecting single-hop');
+      }
 
       if (this.candidates.length === 0 && this.relayIp.length > 0 && this.relayKey.length > 0) {
         this.candidates = [
@@ -300,7 +342,7 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       if (this.candidates.length === 0) {
         // Nothing to connect to: the tunnel is up but holds traffic. Say so instead of
         // pretending a connection exists.
-        native.attachTun(this.tunnelFd, TUN_MTU);
+        native.attachTun(this.tunnelFd, mtu);
         this.fail('No relay selected. Pick a country or relay first.');
         return;
       }
@@ -334,11 +376,65 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
   }
 
   /**
+   * True when this connection is a two-device multihop chain: an exit relay with a usable
+   * endpoint address was handed over by the UI.
+   */
+  private multihop(): boolean {
+    return this.exitKey.length > 0 && this.exitEndpointIp().length > 0;
+  }
+
+  /**
+   * Address of the exit relay's WireGuard listener. Upstream always reaches the exit over
+   * IPv4 (`exit.ipv4_addr_in`): the entry relay forwards to it, so the family the entry
+   * attempt dials does not matter.
+   */
+  private exitEndpointIp(): string {
+    return this.exitIpv4.length > 0 ? this.exitIpv4 : this.exitIpv6;
+  }
+
+  /** Bytes the second WireGuard header adds, for the MTU accounting. */
+  private exitOverhead(): number {
+    return this.exitEndpointIp().includes(':') ? EXIT_IPV6_OVERHEAD : EXIT_IPV4_OVERHEAD;
+  }
+
+  /** MTU the vNIC advertises: one header less when multihop is on, floored at 1280. */
+  private effectiveMtu(): number {
+    if (!this.multihop()) {
+      return TUN_MTU;
+    }
+    return Math.max(MIN_MULTIHOP_MTU, TUN_MTU - this.exitOverhead());
+  }
+
+  /** The assigned tunnel address without its prefix, used as the exit packet source. */
+  private sourceIpv4(): string {
+    const parts: string[] = this.tunnelIpv4.split('/');
+    return parts.length > 0 ? parts[0] : '';
+  }
+
+  /**
    * Per-transport settings the native core needs as JSON: the QUIC token and SNI, an
    * LWO version, a udp2tcp port. Empty when the transport has nothing to say.
+   *
+   * The multihop exit is shared by every transport and rides in the same object, under
+   * `exit`, because that is where the core looks for it.
    */
   private transportSettings(entry: TransportDescriptor, candidate: RelayCandidate): string {
-    return '';
+    const settings: Record<string, Object> = {};
+    if (this.multihop()) {
+      const exit: Record<string, Object> = {
+        'ip': this.exitEndpointIp(),
+        'publicKey': this.exitKey,
+        'port': EXIT_PORT
+      };
+      if (this.exitHostname.length > 0) {
+        exit['hostname'] = this.exitHostname;
+      }
+      settings['exit'] = exit;
+      // The exit device synthesizes IPv4 packets, so their source has to be the address
+      // the entry relay knows belongs to this device, not the 10.64.0.1 gateway.
+      settings['sourceIpv4'] = this.sourceIpv4();
+    }
+    return Object.keys(settings).length > 0 ? JSON.stringify(settings) : '';
   }
 
   /**
@@ -419,6 +515,9 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       }
 
       const wireguardPort: number = obfuscated ? SS_INNER_PORT : port;
+      // `TUN_MTU` is the base MTU: the core subtracts the multihop header itself when the
+      // settings carry an exit, and logs the effective value. The vNIC was created with
+      // that same effective value in setup().
       const started = JSON.parse(native.tunnelStart(this.tunnelFd, TUN_MTU, candidate.publicKey,
         endpointIp, wireguardPort, bridge, entry.kind, this.transportSettings(entry, candidate))) as
         Record<string, Object>;
@@ -428,6 +527,10 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         `${endpointIp}:${port} ipv${family} ` +
         `${obfuscated ? `shadowsocks via ${ssHost}` : 'direct'}`);
       if (started['ok'] === true) {
+        if (started['mtu'] !== undefined) {
+          native.logLine(`engine mtu ${started['mtu']} · vNIC ${this.effectiveMtu()} · ` +
+            `multihop ${started['multihop'] === true ? 'on' : 'off'}`);
+        }
         return;
       }
       const reason: string = started['error'] !== undefined ? started['error'] as string : 'unknown';
@@ -465,6 +568,15 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
     });
   }
 
+  /**
+   * How long one candidate gets before the ladder moves on. Multihop asks the entry and
+   * then the exit device for a handshake, sequentially, so the healthy path can take close
+   * to two handshake timeouts.
+   */
+  private attemptTimeout(): number {
+    return this.multihop() ? ATTEMPT_MS * 2 + 1000 : ATTEMPT_MS;
+  }
+
   private tick(): void {
     // Heartbeat: proves from hilog whether this process keeps running while the app is
     // in the background, which is what decides if the tunnel survives.
@@ -491,7 +603,7 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         this.fail(`${this.target} did not complete a handshake within ` +
           `${BUDGET_MS / 1000} s.`);
         return;
-      } else if (status.error.length > 0 || Date.now() - this.attemptStartedAt > ATTEMPT_MS) {
+      } else if (status.error.length > 0 || Date.now() - this.attemptStartedAt > this.attemptTimeout()) {
         native.logLine(`relay ${this.target}: sent ${status.udpSent} datagrams, received ` +
           `${status.udpRecv}${status.error.length > 0 ? ` · ${status.error}` : ''}`);
         native.logLine(`relay ${this.target} did not answer, trying the next one`);
