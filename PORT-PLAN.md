@@ -538,6 +538,16 @@ ladder is comfortable.
 
 ## 8. UI backlog
 
+**Next goal after the feature work: a UI/UX pass.** The settings screen has outgrown itself —
+DNS moved to its own screen, but protocol preference, kill switch, IP version, direct
+connection, diagnostics, DAITA and multihop still stack into one long scroll. The main screen
+also scrolls, which it should not for a four-element page. Nothing has been checked at phone
+width: the layout was built on a 2800 px tablet. The pass is: one sub-screen per concern
+(Network, DNS, Privacy, Relay), a main screen that fits without scrolling at tablet height,
+and a small-window run (DevEco's small-screen preview or a phone-sized emulator window) to
+check every screen at 360–420 dp before calling it done.
+
+
 Ordered by what the user feels first, not by what is easiest. Each item is sized in
 "one visible increment" terms.
 
