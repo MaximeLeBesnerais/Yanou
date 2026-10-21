@@ -19,7 +19,7 @@ extern int32_t mh_wg_key_readonly(char* out, int32_t capacity);
 extern int32_t mh_clear_key(void);
 extern int32_t mh_open_udp(const char* host, int32_t port);
 extern int32_t mh_attach_tun(int32_t fd, int32_t mtu);
-extern int32_t mh_open_relay_socket(int32_t family);
+extern int32_t mh_open_relay_socket(int32_t family, int32_t proto);
 extern int32_t mh_stats(char* out, int32_t capacity);
 extern void mh_set_direct_allowed(int32_t allowed);
 extern int32_t mh_api_login(const char* account, const char* pubkey, char* out, int32_t capacity);
@@ -408,15 +408,26 @@ static napi_value WrapAttachTun(napi_env env, napi_callback_info info)
 
 static napi_value WrapOpenRelaySocket(napi_env env, napi_callback_info info)
 {
-    size_t argc = 1;
-    napi_value argv[1] = { 0 };
+    size_t argc = 2;
+    napi_value argv[2] = { 0 };
     napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
     int32_t family = 4;
     if (argc >= 1) {
         napi_get_value_int32(env, argv[0], &family);
     }
+    // The protocol is optional: the original one-argument call still means 'udp'.
+    // 0 is UDP, 1 is TCP; see mh_open_relay_socket for the socket contract.
+    int32_t proto = 0;
+    if (argc >= 2) {
+        char name[8] = { 0 };
+        size_t length = 0;
+        if (napi_get_value_string_utf8(env, argv[1], name, sizeof(name), &length) == napi_ok &&
+            strcmp(name, "tcp") == 0) {
+            proto = 1;
+        }
+    }
     napi_value result;
-    napi_create_int32(env, mh_open_relay_socket(family), &result);
+    napi_create_int32(env, mh_open_relay_socket(family, proto), &result);
     return result;
 }
 

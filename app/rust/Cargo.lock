@@ -575,6 +575,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
+name = "err-context"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "449aad22b1364e927ff3bf50f55404efd705c40065fb47f73f28704de707c89e"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2107,6 +2113,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "udp-over-tcp"
+version = "0.4.0"
+source = "git+https://github.com/mullvad/udp-over-tcp?rev=06e6438d3a2537786efde7185f5675ce5e38d45e#06e6438d3a2537786efde7185f5675ce5e38d45e"
+dependencies = [
+ "err-context",
+ "futures",
+ "log",
+ "nix",
+ "tokio",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2478,6 +2496,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tun",
+ "udp-over-tcp",
  "webpki-roots",
  "x25519-dalek",
 ]
