@@ -1,4 +1,4 @@
-import { vpnExtension, connection } from '@kit.NetworkKit';
+import { vpnExtension, connection, socket } from '@kit.NetworkKit';
 import { commonEventManager, BusinessError, pasteboard, zlib } from '@kit.BasicServicesKit';
 import { common, Want, wantAgent, WantAgent } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
@@ -3449,10 +3449,87 @@ struct Index {
    * and writes the answers to the log. This is the only reliable way to see whether the
    * resolver the tunnel advertises is the one the system actually uses.
    */
+  /** Minimal A query for one name, built by hand so the probe needs no resolver API. */
+  private dnsQueryBytes(name: string): ArrayBuffer {
+    const labels: string[] = name.split('.');
+    let size: number = 12;
+    for (const label of labels) {
+      size += 1 + label.length;
+    }
+    size += 1 + 4;
+    const buffer: ArrayBuffer = new ArrayBuffer(size);
+    const view: DataView = new DataView(buffer);
+    const bytes: Uint8Array = new Uint8Array(buffer);
+    view.setUint16(0, 0x1a2b);
+    view.setUint16(2, 0x0100);
+    view.setUint16(4, 1);
+    let offset: number = 12;
+    for (const label of labels) {
+      bytes[offset] = label.length;
+      offset += 1;
+      for (let i = 0; i < label.length; i++) {
+        bytes[offset] = label.charCodeAt(i);
+        offset += 1;
+      }
+    }
+    bytes[offset] = 0;
+    offset += 1;
+    view.setUint16(offset, 1);
+    view.setUint16(offset + 2, 1);
+    return buffer;
+  }
+
+  /**
+   * Sends one DNS query to a resolver and waits for any answer. The socket is not
+   * protected, so its packets follow the default route: into the tunnel when one is up.
+   * This separates "the resolver answers and the system ignores it" from "the resolver
+   * is unreachable through the tunnel".
+   */
+  private async probeResolver(address: string): Promise<string> {
+    const udp: socket.UDPSocket = socket.constructUDPSocketInstance();
+    try {
+      await udp.bind({ address: '0.0.0.0', port: 0, family: 1 });
+      const reply: Promise<string> = new Promise<string>((resolve: (value: string) => void) => {
+        const timer: number = setTimeout(() => {
+          resolve('timeout');
+        }, 2500);
+        udp.on('message', (value: socket.SocketMessageInfo) => {
+          clearTimeout(timer);
+          resolve(`${value.message.byteLength} B`);
+        });
+        udp.on('error', (err: BusinessError) => {
+          clearTimeout(timer);
+          resolve(`error ${err.code ?? -1}`);
+        });
+      });
+      await udp.send({
+        data: this.dnsQueryBytes('doubleclick.net'),
+        address: { address: address, port: 53, family: 1 }
+      });
+      return await reply;
+    } catch (e) {
+      const err = e as BusinessError;
+      return `send failed ${err.code ?? -1}`;
+    } finally {
+      try {
+        await udp.close();
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'probe close failed');
+      }
+    }
+  }
+
   private async diagDnsCheck(): Promise<void> {
     const hosts: string[] = ['example.com', 'doubleclick.net', 'googlesyndication.com'];
     native.setDiagnostics(this.diagnosticsEnabled);
     native.logLine(`dns check: tunnel resolver ${this.dnsLabel()}`);
+    const gatewayProbe: string = await this.probeResolver('10.64.0.1');
+    native.logLine(`dns check: 10.64.0.1:53 -> ${gatewayProbe}`);
+    const chosen: string = this.dnsLabel().split(',')[0].trim();
+    if (chosen.length > 0 && chosen !== '10.64.0.1') {
+      const chosenProbe: string = await this.probeResolver(chosen);
+      native.logLine(`dns check: ${chosen}:53 -> ${chosenProbe}`);
+    }
     for (const host of hosts) {
       try {
         const addresses: connection.NetAddress[] = await connection.getAddressesByName(host);

@@ -45,13 +45,26 @@ Settings → enable **Multihop**, then pick an **Exit relay** from the server br
 
 ## 4b. DNS on the wire (open)
 
-The resolver the tunnel advertises reaches `VpnConfig.dnsAddresses` (the log line
-`dns: auto · blocking mask 1 · 100.64.0.1` proves it), but the system resolver does not use it
-yet: the in-app **Check DNS** button resolves `doubleclick.net` to a real address with blocking
-on. The check is the app's own `connection.getAddressesByName`, so it is not the shell
-bypassing the VPN. Next step is to prove whether `100.64.0.1:53` answers from inside the
-tunnel at all; if it does, the OS is preferring the physical resolver, and if it does not, the
-range needs a route the system respects.
+The resolver reaches `VpnConfig.dnsAddresses` and answers through the tunnel, but the system
+resolver does not use it.
+
+Evidence, all from one connected session with blocking on:
+
+```
+dns: auto · blocking mask 1 · 100.64.0.1      ← what the tunnel advertises
+dns check: 10.64.0.1:53   -> 129 B            ← default resolver answers
+dns check: 100.64.0.1:53  -> 33 B             ← blocking resolver answers, NXDOMAIN
+dns check: doubleclick.net -> 2404:6800:…     ← connection.getAddressesByName ignores both
+```
+
+So the tunnel side is correct: a raw unprotected UDP query to the resolver gets the blocked
+answer. `connection.getAddressesByName`, the app's own resolver path, still returns a real
+address, which means the platform is not handing the VPN's `dnsAddresses` to the resolver.
+
+Next avenues, in order: check whether netmanager requires the resolver to be added to a
+"network" rather than to the VPN config on this build; try `isInternal`; and if neither works,
+carry DNS blocking in the tunnel itself (intercept port 53 in the core) rather than relying on
+the platform resolver.
 
 ## 5. DAITA
 
