@@ -59,7 +59,17 @@ dns check: doubleclick.net -> 2404:6800:…     ← connection.getAddressesByNam
 
 So the tunnel side is correct: a raw unprotected UDP query to the resolver gets the blocked
 answer. `connection.getAddressesByName`, the app's own resolver path, still returns a real
-address, which means the platform is not handing the VPN's `dnsAddresses` to the resolver.
+address.
+
+The reason is now measured, not guessed:
+
+```
+dns check: default net 219 dnses [202.113.15.2, 202.113.5.6, 2001:250:400:659::3]
+```
+
+The default network still carries the Wi-Fi resolvers. The VPN takes the routes but not the
+default-network role, so netmanager answers lookups from the physical network's DNS and
+`VpnConfig.dnsAddresses` is never consulted.
 
 Next avenues, in order: check whether netmanager requires the resolver to be added to a
 "network" rather than to the VPN config on this build; try `isInternal`; and if neither works,
