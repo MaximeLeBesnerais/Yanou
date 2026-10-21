@@ -933,6 +933,9 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       if (result.ok !== true) {
         const message: string = result.error !== undefined ? result.error : 'unknown error';
         native.logLine(`daita: negotiation failed · ${message}`);
+        // The user asked for DAITA by switching the toggle on; a tunnel that silently
+        // runs without it would be a privacy downgrade, so fail this connection instead.
+        this.fail(`DAITA negotiation failed: ${message}`);
         return;
       }
       const machines: string[] = result.machines !== undefined && result.machines !== null ?
@@ -940,12 +943,15 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       const maxPadding: number = result.maxPadding !== undefined ? result.maxPadding : 0;
       const maxBlocking: number = result.maxBlocking !== undefined ? result.maxBlocking : 0;
       if (machines.length === 0) {
-        native.logLine('daita: relay returned no machines; keeping the tunnel without DAITA');
+        native.logLine('daita: relay returned no machines; failing this connection');
+        this.fail('DAITA negotiation failed: the relay returned no machines. ' +
+          'Pick a DAITA relay or turn the toggle off.');
         return;
       }
       const ephemeralKey: string = result.ephemeralKey !== undefined ? result.ephemeralKey : '';
       if (ephemeralKey.length === 0) {
-        native.logLine('daita: no ephemeral key in the result; keeping the tunnel without DAITA');
+        native.logLine('daita: no ephemeral key in the result; failing this connection');
+        this.fail('DAITA negotiation failed: the relay did not return an ephemeral peer key.');
         return;
       }
       const psk: string = result.psk !== undefined && result.psk !== null ? result.psk : '';
@@ -963,6 +969,7 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
     } catch (e) {
       const err = e as BusinessError;
       native.logLine(`daita: negotiation failed · ${err.code ?? -1}: ${err.message ?? 'unknown'}`);
+      this.fail(`DAITA negotiation failed: ${err.message ?? 'unknown error'}`);
     } finally {
       this.daitaPending = false;
       try {
@@ -985,7 +992,8 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
     const candidate: RelayCandidate | undefined = this.activeCandidate;
     const entry: TransportDescriptor | undefined = this.activeEntry;
     if (candidate === undefined || entry === undefined) {
-      native.logLine('daita: no active relay to restart on; keeping the plain tunnel');
+      native.logLine('daita: no active relay to restart on');
+      this.fail('DAITA negotiation failed: no active relay to restart on.');
       return;
     }
     native.logLine(`daita: restarting with the ephemeral peer on ${candidate.hostname} ` +

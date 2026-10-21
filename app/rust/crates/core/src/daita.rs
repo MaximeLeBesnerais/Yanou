@@ -331,6 +331,16 @@ pub(crate) fn decode_grpc_body(mut data: &[u8]) -> Result<Vec<Vec<u8>>, String> 
 // The exchange
 // ---------------------------------------------------------------------------
 
+/// Aborts the h2 connection task when the exchange ends, so a failed negotiation does
+/// not leave the duplicated socket (and its reactor registration) alive.
+struct AbortTask(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn negotiate_over_stream(
     stream: TcpStream,
     parent_pubkey: [u8; 32],
@@ -343,11 +353,12 @@ async fn negotiate_over_stream(
         .await
         .map_err(|error| format!("config service h2 handshake: {error}"))?;
     // The connection future drives every frame; without it the request never leaves.
-    tokio::spawn(async move {
+    let connection_handle = tokio::spawn(async move {
         if let Err(error) = connection.await {
             log_line(&format!("daita: config service h2 connection closed: {error}"));
         }
     });
+    let _connection_guard = AbortTask(connection_handle);
 
     let request = Request::builder()
         .method(Method::POST)
