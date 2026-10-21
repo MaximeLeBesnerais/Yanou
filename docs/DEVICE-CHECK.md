@@ -43,6 +43,16 @@ Settings → enable **Multihop**, then pick an **Exit relay** from the server br
   then `tunnel: multihop handshake confirmed on both devices`.
 - A large transfer (a file download) must not stall.
 
+## 4b. DNS on the wire (open)
+
+The resolver the tunnel advertises reaches `VpnConfig.dnsAddresses` (the log line
+`dns: auto · blocking mask 1 · 100.64.0.1` proves it), but the system resolver does not use it
+yet: the in-app **Check DNS** button resolves `doubleclick.net` to a real address with blocking
+on. The check is the app's own `connection.getAddressesByName`, so it is not the shell
+bypassing the VPN. Next step is to prove whether `100.64.0.1:53` answers from inside the
+tunnel at all; if it does, the OS is preferring the physical resolver, and if it does not, the
+range needs a route the system respects.
+
 ## 5. DAITA
 
 Settings → DAITA on, then connect to a relay that advertises it.

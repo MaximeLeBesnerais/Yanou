@@ -541,6 +541,26 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         hilog.info(DOMAIN, TAG, 'ipv6 %{public}s', ipv6Cidr);
       }
 
+      // The blocking resolver sits in 100.64.0.0/10, a range the system tends to treat
+      // like a private network and keep off the VPN. A host route per resolver is meant to
+      // pin it to the tunnel; it has not changed the observed behaviour yet (queries still
+      // resolve through the physical DNS), so this stays as the routing half of the fix
+      // while the resolver reachability is investigated.
+      for (const address of dns.addresses) {
+        if (isLocalDnsAddress(address)) {
+          continue;
+        }
+        const v6: boolean = address.includes(':');
+        routes.push({
+          interface: 'vpn-tun',
+          destination: { address: { address: address, family: v6 ? 2 : 1 },
+            prefixLength: v6 ? 128 : 32 },
+          gateway: { address: v6 ? '::' : tunAddress, family: v6 ? 2 : 1 },
+          hasGateway: false,
+          isDefaultRoute: false
+        });
+      }
+
       // Private resolvers cannot be reached through the relay, so their traffic has to
       // leave by the physical network even though the default route claims everything.
       for (const address of dns.excluded) {

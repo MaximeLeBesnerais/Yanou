@@ -1,4 +1,4 @@
-import { vpnExtension } from '@kit.NetworkKit';
+import { vpnExtension, connection } from '@kit.NetworkKit';
 import { commonEventManager, BusinessError, pasteboard, zlib } from '@kit.BasicServicesKit';
 import { common, Want, wantAgent, WantAgent } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
@@ -3444,6 +3444,28 @@ struct Index {
     return seen;
   }
 
+  /**
+   * Resolves a few names through the default network, which is the tunnel while it is up,
+   * and writes the answers to the log. This is the only reliable way to see whether the
+   * resolver the tunnel advertises is the one the system actually uses.
+   */
+  private async diagDnsCheck(): Promise<void> {
+    const hosts: string[] = ['example.com', 'doubleclick.net', 'googlesyndication.com'];
+    native.setDiagnostics(this.diagnosticsEnabled);
+    native.logLine(`dns check: tunnel resolver ${this.dnsLabel()}`);
+    for (const host of hosts) {
+      try {
+        const addresses: connection.NetAddress[] = await connection.getAddressesByName(host);
+        const first: string = addresses.length > 0 ? addresses[0].address : 'no address';
+        native.logLine(`dns check: ${host} -> ${first}`);
+      } catch (e) {
+        const err = e as BusinessError;
+        native.logLine(`dns check: ${host} -> failed (${err.code ?? -1})`);
+      }
+    }
+    this.readLogs();
+  }
+
   /** Writes a string to a picked document URI. */
   private async saveText(uri: string, text: string): Promise<void> {
     const file = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
@@ -3860,6 +3882,20 @@ struct Index {
       .width('100%')
       .scrollBar(BarState.Off)
       .align(Alignment.TopStart)
+
+      Row() {
+        Button('Check DNS')
+          .type(ButtonType.Capsule)
+          .width('100%')
+          .height(38)
+          .fontSize(14)
+          .backgroundColor($r('sys.color.comp_background_secondary'))
+          .fontColor($r('sys.color.font_secondary'))
+          .onClick(() => {
+            this.diagDnsCheck();
+          })
+      }
+      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, bottom: 4 })
 
       Row({ space: 8 }) {
         Button('Export all (zip)')
