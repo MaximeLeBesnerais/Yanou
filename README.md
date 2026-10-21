@@ -323,9 +323,8 @@ The app is distributed under GPL-3.0-or-later and comes with no warranty; [`LICE
 is the whole agreement. There are no terms of service, because there is no service to agree
 to.
 
-Your Mullvad account is governed by [Mullvad's terms of
-service](https://mullvad.net/en/help/terms-service), not by this project. 燕鸥 is not a party
-to that agreement.
+Your Mullvad account is governed by Mullvad's own terms of service, not by this project.
+燕鸥 is not a party to that agreement.
 
 The app collects nothing. It keeps the account token in the device keystore and the WireGuard
 key in the app sandbox, and it contacts only Mullvad's API and the relay you select.
