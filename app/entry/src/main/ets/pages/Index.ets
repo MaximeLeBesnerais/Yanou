@@ -431,8 +431,14 @@ struct Index {
     const stamp: string = await VpnSettings.getString(getContext(this) as common.Context,
       'relaysFetchedAt', '0');
     const age: number = Date.now() - Number.parseInt(stamp, 10);
+    // A cache written before the transport fields existed would leave every LWO and QUIC
+    // rung dead for a day after an upgrade, because those entries are gated on the relay
+    // advertising them. Treat such a cache as stale.
+    const carriesTransports: boolean = this.relays.some((relay: RelayItem) =>
+      relay.lwo !== undefined || relay.lwoV2 !== undefined || relay.quic !== undefined);
     // The relay list changes daily at most; refetching on every open just hammers the API.
-    if (this.relays.length === 0 || isNaN(age) || age > 24 * 60 * 60 * 1000) {
+    if (this.relays.length === 0 || !carriesTransports || isNaN(age) ||
+      age > 24 * 60 * 60 * 1000) {
       await this.refreshRelays();
     }
   }
