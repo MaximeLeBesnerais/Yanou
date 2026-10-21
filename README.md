@@ -54,8 +54,12 @@ scam.
 - Device IP version setting: `IPv4 only` (default), `IPv6 only`, or both. Traffic from the
   excluded family is routed into the tunnel and dropped, and system blocking is enabled
   while a family is excluded.
-- Transport ladder with plain WireGuard and Shadowsocks obfuscation, plus a protocol
-  preference (`Automatic`, `WireGuard only`, `Obfuscated only`).
+- Transport ladder: plain WireGuard, LWO, Shadowsocks, udp2tcp and QUIC/MASQUE, walked in
+  that order, with a protocol preference (`Automatic`, `WireGuard only`, `Obfuscated only`).
+- DNS: the tunnel resolver with optional content blocking (ads, trackers, malware, adult
+  content, gambling, social media), or your own resolvers.
+- Multihop: an entry relay and a separate exit relay, with the exit chosen from the same
+  server browser.
 - Kill switch, which enables the system blocking mode. It is forced on when a family is
   excluded.
 - Continuous background task and a status notification with Disconnect and Reconnect
@@ -63,11 +67,10 @@ scam.
 - Automatic rekey before the WireGuard session expires, and watchdogs for a stalled tunnel.
 - Diagnostics: one log section per connection attempt, viewable in the app and exportable.
 
-Not implemented: DAITA, multihop, LWO, QUIC/MASQUE, udp2tcp, DNS content blocking and custom
-DNS. The DAITA switch currently only filters the relay list to relays that advertise support.
-[`PORT-PLAN.md`](PORT-PLAN.md) section 7 has a plan for each. Per-application tunnelling is
-excluded: HarmonyOS does not let a normal app enumerate installed applications, so the picker
-cannot exist.
+Not implemented: DAITA (in progress; the switch currently only filters the relay list to
+relays that advertise support) and per-application tunnelling, which HarmonyOS does not
+allow a normal app to offer because it cannot enumerate installed applications.
+[`PORT-PLAN.md`](PORT-PLAN.md) section 7 has the plan and the unit breakdown for both.
 
 ## Requirements
 

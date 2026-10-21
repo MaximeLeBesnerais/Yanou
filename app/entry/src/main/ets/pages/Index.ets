@@ -4037,12 +4037,12 @@ struct Index {
 
   private setProtocolHint(): string {
     if (this.protocolMode === 'direct') {
-      return 'Always plain WireGuard: fastest, but blocked on networks that filter VPN traffic.';
+      return 'Plain WireGuard only: fastest, but blocked on networks that filter VPN traffic.';
     }
     if (this.protocolMode === 'obfuscated') {
-      return 'Always through the bridge: slower, works where WireGuard is blocked.';
+      return 'Only the obfuscated transports: LWO, Shadowsocks, udp2tcp and QUIC. Slower, but works where WireGuard is blocked.';
     }
-    return 'Tries plain WireGuard first, falls back to the bridge when that is blocked.';
+    return 'Tries plain WireGuard first, then LWO, Shadowsocks, udp2tcp and QUIC when a network blocks it.';
   }
 
   /** A hand-edited or stale stored value must not leave the segmented control empty. */
