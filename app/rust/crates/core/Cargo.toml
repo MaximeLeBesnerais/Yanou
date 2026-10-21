@@ -38,3 +38,9 @@ webpki-roots = "1"
 # Shadowsocks AEAD in UDP mode. Same crate and cipher their client uses.
 bytes = "1"
 shadowsocks = { version = "1.25.0", default-features = false, features = ["aead-cipher", "stream-cipher"] }
+
+# udp2tcp: datagrams length-prefixed into a TCP stream for networks that pass TCP and
+# drop UDP. Mullvad's fork, pinned to the same revision their own client locks; the
+# crate published on crates.io is not this code. No features: only the library's
+# framing and forwarder are used, not the `udp2tcp`/`tcp2udp` binaries.
+udp-over-tcp = { git = "https://github.com/mullvad/udp-over-tcp", rev = "06e6438d3a2537786efde7185f5675ce5e38d45e" }

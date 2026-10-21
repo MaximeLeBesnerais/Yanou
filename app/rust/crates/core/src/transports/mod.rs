@@ -1,9 +1,10 @@
 //! How WireGuard datagrams reach a relay.
 //!
 //! One module per transport, each implementing [`Transport`]: `direct` is plain UDP to the
-//! relay, `shadowsocks` wraps every datagram for a bridge relay, and `lwo` obfuscates the
-//! WireGuard header for a relay that advertises LWO. udp2tcp and QUIC land here as sibling
-//! modules and plug into [`TransportFactory`], without touching the engine.
+//! relay, `shadowsocks` wraps every datagram for a bridge relay, `lwo` obfuscates the
+//! WireGuard header for a relay that advertises it, and `udp2tcp` frames the datagrams into
+//! a TCP stream. QUIC lands here as a sibling module and plugs into [`TransportFactory`],
+//! without touching the engine.
 //!
 //! The socket is created by the extension and `protect()`ed, so it bypasses the tunnel the
 //! engine is building.
@@ -11,6 +12,7 @@
 mod direct;
 mod lwo;
 mod shadowsocks;
+mod udp2tcp;
 
 use std::future::Future;
 use std::io;
@@ -22,7 +24,20 @@ use std::sync::Arc;
 use gotatun::noise::TimerParams;
 use gotatun::packet::{Packet, PacketBufPool};
 use gotatun::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
-use tokio::net::UdpSocket;
+use tokio::net::{TcpSocket, UdpSocket};
+
+/// The relay socket the extension opened and protected for one connection attempt.
+///
+/// Most transports put datagrams on a UDP socket. udp2tcp puts them on a TCP stream, and
+/// the socket has to exist before the extension can `protect()` it, so the core keeps one
+/// slot per socket kind and the factory below claims the one the transport needs. See
+/// `mh_open_relay_socket` in `lib.rs` for the full contract.
+pub enum RelaySocket {
+    /// Still the standard-library socket: the tunnel probe uses it with timeouts before
+    /// the factory turns it into the async one.
+    Udp(std::net::UdpSocket),
+    Tcp(TcpSocket),
+}
 
 /// A datagram pipe that has already been configured for one relay.
 ///
@@ -131,13 +146,19 @@ pub struct TransportFactory {
     transport: Box<dyn Transport>,
 }
 
+/// Moves the standard-library socket into the reactor. Called inside the runtime, from
+/// the factory, so the conversion cannot happen before the runtime exists.
+fn async_udp(socket: std::net::UdpSocket) -> Result<UdpSocket, String> {
+    UdpSocket::from_std(socket).map_err(|error| format!("relay socket: {error}"))
+}
+
 impl TransportFactory {
     /// `transport` names the transport to build; `bridge` is the Shadowsocks endpoint it
     /// needs, `settings` the per-transport JSON the extension produced, and `peer_key` the
     /// relay's WireGuard public key (LWO derives its obfuscation keys from it). Adding a
     /// transport is one arm here and one module, never a new selector.
     pub fn new(
-        socket: UdpSocket,
+        socket: RelaySocket,
         relay: SocketAddr,
         bridge: Option<SocketAddr>,
         transport: &str,
@@ -145,12 +166,42 @@ impl TransportFactory {
         peer_key: Option<[u8; 32]>,
     ) -> Result<Self, String> {
         let transport: Box<dyn Transport> = match transport {
-            "" | "direct" => Box::new(direct::Direct::new(socket, relay)),
-            "shadowsocks" => match bridge {
-                Some(bridge) => Box::new(shadowsocks::Shadowsocks::new(socket, relay, bridge)?),
-                None => return Err("shadowsocks without a bridge endpoint".into()),
+            "" | "direct" => match socket {
+                RelaySocket::Udp(socket) => {
+                    Box::new(direct::Direct::new(async_udp(socket)?, relay))
+                }
+                RelaySocket::Tcp(_) => return Err("direct needs a UDP relay socket".into()),
             },
-            "lwo" => Box::new(lwo::Lwo::new(socket, relay, peer_key, settings)?),
+            "shadowsocks" => {
+                let Some(bridge) = bridge else {
+                    return Err("shadowsocks without a bridge endpoint".into());
+                };
+                match socket {
+                    RelaySocket::Udp(socket) => Box::new(shadowsocks::Shadowsocks::new(
+                        async_udp(socket)?,
+                        relay,
+                        bridge,
+                    )?),
+                    RelaySocket::Tcp(_) => {
+                        return Err("shadowsocks needs a UDP relay socket".into())
+                    }
+                }
+            }
+            "udp2tcp" => match socket {
+                RelaySocket::Tcp(socket) => {
+                    Box::new(udp2tcp::Udp2Tcp::new(socket, relay, settings)?)
+                }
+                RelaySocket::Udp(_) => {
+                    return Err("udp2tcp needs a TCP relay socket (openRelaySocket(family, 'tcp'))"
+                        .into())
+                }
+            },
+            "lwo" => match socket {
+                RelaySocket::Udp(socket) => {
+                    Box::new(lwo::Lwo::new(async_udp(socket)?, relay, peer_key, settings)?)
+                }
+                RelaySocket::Tcp(_) => return Err("lwo needs a UDP relay socket".into()),
+            },
             other => return Err(format!("unknown transport '{other}'")),
         };
         Ok(Self { transport })

@@ -54,17 +54,19 @@ const REBUILD_GAP_MS: number = 2000;
 
 /**
  * One rung of the transport ladder: which family to dial, and how the datagrams are
- * hidden on the way to the relay.
+ * carried to the relay — plain UDP, LWO over the relay, Shadowsocks through a bridge, or
+ * a TCP stream with udp2tcp.
  */
 interface TransportDescriptor {
   /** Stable name used in diagnostics; one transport may have one entry per family. */
   id: string;
   /** Which transport the native core builds for this attempt. */
-  kind: 'direct' | 'shadowsocks' | 'lwo';
+  kind: 'direct' | 'shadowsocks' | 'lwo' | 'udp2tcp';
   family: 'v4' | 'v6';
   /**
-   * True when the attempt hides WireGuard: Shadowsocks through a bridge, or LWO over the
-   * relay itself. The protocol preference keeps only these in obfuscated mode.
+   * True when the attempt hides WireGuard: Shadowsocks through a bridge, LWO over the
+   * relay itself, or udp2tcp inside a TCP stream. The protocol preference keeps only
+   * these in obfuscated mode.
    */
   obfuscated: boolean;
 }
@@ -86,8 +88,11 @@ function lwoVersionOf(candidate: RelayCandidate): number {
 /**
  * Transport ladder, mirroring the official client's `RETRY_ORDER`: the plain IPv6 path
  * first (the only one that survives a filtered IPv4 network), then IPv4, then LWO over
- * the relay itself, then Mullvad's Shadowsocks bridges. Every entry is retried with a
- * fresh port and, once the relay list is exhausted, a fresh relay.
+ * the relay itself, then Mullvad's Shadowsocks bridges, and finally udp2tcp — a network
+ * that drops UDP may still pass TCP. The v6 rungs are skipped by `startCandidate` for a
+ * relay that publishes no IPv6 address, which is the only capability udp2tcp needs.
+ * Every entry is retried with a fresh port and, once the relay list is exhausted, a
+ * fresh relay.
  *
  * The protocol preference filters this table. Adding a transport is one entry here plus
  * the code that dials it — never another branch in `startCandidate`.
@@ -98,13 +103,27 @@ const TRANSPORTS: TransportDescriptor[] = [
   { id: 'direct-v4', kind: 'direct', family: 'v4', obfuscated: false },
   { id: 'lwo-v4', kind: 'lwo', family: 'v4', obfuscated: true },
   { id: 'lwo-v6', kind: 'lwo', family: 'v6', obfuscated: true },
-  { id: 'shadowsocks-v6', kind: 'shadowsocks', family: 'v6', obfuscated: true }
+  { id: 'shadowsocks-v6', kind: 'shadowsocks', family: 'v6', obfuscated: true },
+  { id: 'udp2tcp-v4', kind: 'udp2tcp', family: 'v4', obfuscated: true },
+  { id: 'udp2tcp-v6', kind: 'udp2tcp', family: 'v6', obfuscated: true }
 ];
 /** Shadowsocks ports published by the relay list (`wireguard.shadowsocks_port_ranges`). */
 const SS_PORT_MIN: number = 51900;
 const SS_PORT_MAX: number = 51949;
+/**
+ * TCP ports the relay's udp2tcp listener accepts, in the order the official client tries
+ * them. Upstream hardcodes the same three (`UDP2TCP_PORTS` in `mullvad-api`'s relay
+ * list); the API does not publish them, so there is nothing to read from the relay list.
+ */
+const UDP2TCP_PORTS: number[] = [80, 443, 5001];
 /** Port of the relay's own WireGuard listener, seen from inside the obfuscated tunnel. */
-const SS_INNER_PORT: number = 51820;
+const INNER_WG_PORT: number = 51820;
+
+/** Per-transport settings the native core reads from `settings` in `tunnelStart`. */
+interface Udp2TcpSettings {
+  /** Relay TCP port for this udp2tcp attempt; one of UDP2TCP_PORTS. */
+  port: number;
+}
 
 /**
  * The VPN service process.
@@ -130,7 +149,7 @@ interface RelayCandidate {
 export default class YanouVpnAbility extends VpnExtensionAbility {
   private connection: vpnExtension.VpnConnection | undefined = undefined;
   private tunnelFd: number = -1;
-  private udpFd: number = -1;
+  private relayFd: number = -1;
   private ticker: number = -1;
   private publicKey: string = '';
   private phase: string = 'idle';
@@ -143,6 +162,8 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
   private connectStartedAt: number = 0;
   private diagnostics: boolean = false;
   private portIndex: number = 0;
+  /** Position in UDP2TCP_PORTS; each udp2tcp attempt takes the next one. */
+  private udp2tcpPortIndex: number = 0;
   private ticks: number = 0;
   private tunnelIpv4: string = '';
   /** Public key the account registered for this device. */
@@ -326,6 +347,7 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
 
       this.connectStartedAt = Date.now();
       this.portIndex = 0;
+      this.udp2tcpPortIndex = 0;
       // Protocol preference: Automatic walks every transport, otherwise only one family.
       try {
         const mode: string = await VpnSettings.getString(this.context, 'protocolMode', 'auto');
@@ -355,13 +377,21 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
   /**
    * Per-transport settings the native core needs as JSON: the QUIC token and SNI, an
    * LWO version, a udp2tcp port. Empty when the transport has nothing to say.
+   *
+   * `port` is the port this attempt already chose, so the JSON and the endpoint the
+   * attempt logs can never disagree.
    */
-  private transportSettings(entry: TransportDescriptor, candidate: RelayCandidate): string {
+  private transportSettings(entry: TransportDescriptor, candidate: RelayCandidate,
+    port: number): string {
     if (entry.kind === 'lwo') {
       const version: number = lwoVersionOf(candidate);
       // An empty settings string means "this entry cannot be dialled"; startCandidate
       // skips such an attempt before it opens a socket.
       return version > 0 ? `{"version":${version}}` : '';
+    }
+    if (entry.kind === 'udp2tcp') {
+      const settings: Udp2TcpSettings = { port: port };
+      return JSON.stringify(settings);
     }
     return '';
   }
@@ -403,9 +433,13 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       this.candidateIndex += 1;
 
       const wantsV6: boolean = entry.family === 'v6';
+      const isUdp2Tcp: boolean = entry.kind === 'udp2tcp';
+      const isShadowsocks: boolean = entry.kind === 'shadowsocks';
       const ipv6: string = candidate.ipv6 !== undefined && candidate.ipv6 !== null ?
         candidate.ipv6 : '';
       if (wantsV6 && ipv6.length === 0) {
+        // The only capability udp2tcp needs is an address in the family being dialled:
+        // its TCP ports are hardcoded, not published per relay.
         continue;
       }
       // LWO is only dialled when the relay advertises it. Skipping the rung costs one
@@ -414,21 +448,23 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       if (entry.kind === 'lwo' && lwoVersion === 0) {
         continue;
       }
-      // Only Shadowsocks goes through a bridge; LWO talks to the relay's own address on
-      // its own WireGuard ports.
-      const bridged: boolean = entry.kind === 'shadowsocks';
+      // Only Shadowsocks goes through a bridge; LWO and udp2tcp talk to the relay's own
+      // address.
       const endpointIp: string = wantsV6 ? ipv6 : candidate.ip;
       const family: number = wantsV6 ? 6 : 4;
-      const port: number = bridged ? this.nextShadowsocksPort() : this.nextPort();
+      // Each transport has its own port chain: udp2tcp's three TCP ports, the bridge's
+      // Shadowsocks range, or the published WireGuard UDP ranges.
+      const port: number = isUdp2Tcp ? this.nextUdp2TcpPort() :
+        (isShadowsocks ? this.nextShadowsocksPort() : this.nextPort());
       // Shadowsocks goes to a dedicated address when the relay publishes one; the relay's
-      // own address is the one that gets blackholed.
+      // own address is the one that gets blackholed. udp2tcp has no such list: the relay
+      // itself listens for it, so it must use the relay's own address.
       const extra: string[] = candidate.ssExtra !== undefined && candidate.ssExtra !== null ?
         candidate.ssExtra : [];
-      const ssHost: string = bridged ?
-        (extra.length > 0 ? extra[Math.floor(Math.random() * extra.length)] : endpointIp) :
-        endpointIp;
-      const hostPort: string = ssHost.includes(':') ? `[${ssHost}]:${port}` : `${ssHost}:${port}`;
-      const bridge: string = bridged ? hostPort : '';
+      const host: string = isShadowsocks && extra.length > 0 ?
+        extra[Math.floor(Math.random() * extra.length)] : endpointIp;
+      const hostPort: string = host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
+      const bridge: string = isShadowsocks ? hostPort : '';
 
       this.target = candidate.hostname;
       // Record what this attempt is before dialling, so a payload published mid-attempt
@@ -439,29 +475,36 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       this.handshakeMs = 0;
       this.attemptStartedAt = Date.now();
 
-      const udpFd: number = native.openRelaySocket(family);
-      this.udpFd = udpFd;
-      if (udpFd >= 0 && this.connection !== undefined) {
+      // udp2tcp rides a TCP stream and needs a TCP socket; every other transport sends
+      // datagrams from a UDP socket. Either way the extension protects the fd it opened,
+      // and the core claims the matching slot by transport name.
+      const proto: string = isUdp2Tcp ? 'tcp' : 'udp';
+      const relayFd: number = native.openRelaySocket(family, proto);
+      this.relayFd = relayFd;
+      if (relayFd >= 0 && this.connection !== undefined) {
         try {
-          await this.connection.protect(udpFd);
+          await this.connection.protect(relayFd);
         } catch (e) {
           const err = e as BusinessError;
-          native.logLine(`protect fd ${udpFd} failed: ${err.code ?? -1}`);
+          native.logLine(`protect fd ${relayFd} failed: ${err.code ?? -1}`);
         }
       } else {
-        native.logLine(`relay socket not available (${udpFd})`);
+        native.logLine(`relay socket not available (${relayFd})`);
       }
 
-      const wireguardPort: number = bridged ? SS_INNER_PORT : port;
+      // Shadowsocks and udp2tcp carry the datagrams to the relay's own loopback listener;
+      // LWO wraps them in place, so the peer endpoint is the address actually dialled.
+      const wireguardPort: number = (isShadowsocks || isUdp2Tcp) ? INNER_WG_PORT : port;
       const started = JSON.parse(native.tunnelStart(this.tunnelFd, TUN_MTU, candidate.publicKey,
-        endpointIp, wireguardPort, bridge, entry.kind, this.transportSettings(entry, candidate))) as
-        Record<string, Object>;
+        endpointIp, wireguardPort, bridge, entry.kind,
+        this.transportSettings(entry, candidate, port))) as Record<string, Object>;
       hilog.info(DOMAIN, TAG, 'attempt %{public}s %{public}s', candidate.hostname,
         JSON.stringify(started));
-      const route: string = bridged ? `shadowsocks via ${ssHost}` :
-        (entry.kind === 'lwo' ? `lwo v${lwoVersion}` : 'direct');
+      const route: string = isShadowsocks ? `shadowsocks via ${host}` :
+        (isUdp2Tcp ? 'udp2tcp' :
+          (entry.kind === 'lwo' ? `lwo v${lwoVersion}` : 'direct'));
       native.logLine(`attempt ${this.candidateIndex}: ${candidate.hostname} ` +
-        `${endpointIp}:${port} ipv${family} ${route}`);
+        `${hostPort} ipv${family} ${route}`);
       if (started['ok'] === true) {
         return;
       }
@@ -474,6 +517,16 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
 
   private nextShadowsocksPort(): number {
     return SS_PORT_MIN + Math.floor(Math.random() * (SS_PORT_MAX - SS_PORT_MIN + 1));
+  }
+
+  /**
+   * 80, 443, 5001, then around again: the relay's udp2tcp listener publishes no ports in
+   * the API, so these are the three the official client cycles through.
+   */
+  private nextUdp2TcpPort(): number {
+    const port: number = UDP2TCP_PORTS[this.udp2tcpPortIndex % UDP2TCP_PORTS.length];
+    this.udp2tcpPortIndex += 1;
+    return port;
   }
 
   /**

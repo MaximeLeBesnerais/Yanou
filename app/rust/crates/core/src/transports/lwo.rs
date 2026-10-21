@@ -815,8 +815,12 @@ mod tests {
 
         // The factory arm is what the extension reaches; it must accept the LWO name and
         // carry the timer override out to the engine.
+        // The factory takes the standard-library socket the extension opened; it converts
+        // it inside the runtime.
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        std_socket.set_nonblocking(true).expect("nonblocking");
         let factory = super::super::TransportFactory::new(
-            bind().await,
+            crate::transports::RelaySocket::Udp(std_socket),
             relay,
             None,
             "lwo",

@@ -74,11 +74,17 @@ export const apiAccount: (token: string) => Promise<string>;
 export const apiRelays: () => Promise<string>;
 
 /**
- * Creates the unconnected UDP socket the WireGuard engine will use. The caller must pass
- * the returned fd to `VpnConnection.protect()` so the handshake leaves the device instead
- * of being routed back into the tunnel being built. Returns the fd, or negative on error.
+ * Creates the unconnected relay socket for one connection attempt. The caller must pass
+ * the returned fd to `VpnConnection.protect()` before `tunnelStart`, so the connection
+ * leaves the device instead of being routed back into the tunnel being built.
+ *
+ * `proto` is `'udp'` (the default, and what every pre-existing call means) or `'tcp'`
+ * for a transport that rides a TCP stream (`udp2tcp`). Both are bound to a local port in
+ * `family` and left unconnected: the core connects the TCP one only after `protect()`.
+ * The transport named in `tunnelStart` picks the socket it needs. Returns the fd, or
+ * negative on error.
  */
-export const openRelaySocket: (family: number) => number;
+export const openRelaySocket: (family: number, proto?: string) => number;
 
 /**
  * Starts the WireGuard engine on an already-created tun fd. Requires a socket from

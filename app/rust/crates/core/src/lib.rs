@@ -11,7 +11,7 @@
 
 use std::ffi::CStr;
 use std::io::{Read, Write};
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::os::raw::{c_char, c_int};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -35,6 +35,10 @@ static RELAY_FD: AtomicI32 = AtomicI32::new(-1);
 static STARTED: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_DST: Mutex<[u8; 4]> = Mutex::new([0, 0, 0, 0]);
 static RELAY: Mutex<Option<UdpSocket>> = Mutex::new(None);
+/// The TCP counterpart of [`RELAY`], for transports that ride a TCP stream (udp2tcp).
+/// The socket is deliberately unconnected until the transport connects it after the
+/// extension has called `protect()`; see [`mh_open_relay_socket`].
+static RELAY_TCP: Mutex<Option<tokio::net::TcpSocket>> = Mutex::new(None);
 static FILES_DIR: Mutex<String> = Mutex::new(String::new());
 /// Diagnostics are opt-in: nothing is written to the log unless the user turns it on.
 static DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
@@ -321,8 +325,44 @@ pub extern "C" fn mh_clear_key() -> c_int {
     }
 }
 
+/// Opens the relay socket for one connection attempt and stores it for [`mh_tunnel_start`].
+///
+/// # Socket contract
+///
+/// The extension creates the socket, gets its fd back, and passes that fd to
+/// `VpnConnection.protect()`; the core owns the socket from creation and the transport
+/// consumes it from `take_relay_socket()`. One socket per attempt, and its kind is fixed
+/// by the transport the extension is about to name in `mh_tunnel_start`:
+///
+/// * `proto == 0` (`'udp'`, the default): a bound, **unconnected**, non-blocking UDP
+///   socket in the relay's address family. `direct` and `shadowsocks` take this one.
+/// * `proto == 1` (`'tcp'`): a bound, **unconnected**, non-blocking TCP socket in the same
+///   family, which `udp2tcp` connects to the relay's TCP listener (`peer` = relay address
+///   + the port from its `{"port":n}` settings). It must stay unconnected until after
+///   `protect()`: a connect before that would pick the route that is about to become the
+///   tunnel, and the stream would loop back into the device.
+///
+/// The core picks the slot by transport name in [`take_relay_socket`]; opening a socket
+/// drops whatever an earlier attempt left behind, so an unclaimed fd never lingers.
 #[no_mangle]
-pub extern "C" fn mh_open_relay_socket(family: c_int) -> c_int {
+pub extern "C" fn mh_open_relay_socket(family: c_int, proto: c_int) -> c_int {
+    // One attempt owns at most one relay socket. Drop any socket a previous attempt
+    // created but never reached `tunnelStart` (a refused attempt, for example).
+    if let Ok(mut guard) = RELAY.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = RELAY_TCP.lock() {
+        *guard = None;
+    }
+    if proto == 0 {
+        open_relay_udp(family)
+    } else {
+        open_relay_tcp(family)
+    }
+}
+
+/// Binds the unconnected UDP socket `direct` and `shadowsocks` send on.
+fn open_relay_udp(family: c_int) -> c_int {
     // The relay is reached over IPv6 when the host has a global address; the IPv4
     // listener is bound to the matching family so `send_to` never mixes families.
     let bind = if family == 6 { "[::]:0" } else { "0.0.0.0:0" };
@@ -346,9 +386,55 @@ pub extern "C" fn mh_open_relay_socket(family: c_int) -> c_int {
     fd
 }
 
-/// Hands the pre-created socket to the tunnel engine, which owns it from then on.
-pub(crate) fn take_relay_socket() -> Option<UdpSocket> {
-    RELAY.lock().ok().and_then(|mut guard| guard.take())
+/// Binds the unconnected TCP socket `udp2tcp` connects to the relay.
+///
+/// Tokio sockets are non-blocking from creation and register with the reactor only when
+/// they are turned into a stream, so creating this outside the runtime is safe.
+fn open_relay_tcp(family: c_int) -> c_int {
+    let socket = match if family == 6 {
+        tokio::net::TcpSocket::new_v6()
+    } else {
+        tokio::net::TcpSocket::new_v4()
+    } {
+        Ok(socket) => socket,
+        Err(error) => {
+            log_line(&format!("relay tcp socket create failed: {error}"));
+            return -2;
+        }
+    };
+    let bind: SocketAddr = if family == 6 {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+    };
+    if let Err(error) = socket.bind(bind) {
+        log_line(&format!("relay tcp socket bind failed: {error}"));
+        return -2;
+    }
+    let fd = socket.as_raw_fd();
+    if let Ok(mut guard) = RELAY_TCP.lock() {
+        *guard = Some(socket);
+    }
+    RELAY_FD.store(fd, Ordering::SeqCst);
+    log_line(&format!("relay tcp socket fd={fd} family={} (unconnected, awaiting protect)", if family == 6 { "ipv6" } else { "ipv4" }));
+    fd
+}
+
+/// Hands the pre-created socket for `transport` to the tunnel engine, which owns it from
+/// then on. The extension opened exactly one kind, so the transport name picks the slot.
+pub(crate) fn take_relay_socket(transport: &str) -> Option<transports::RelaySocket> {
+    if transport == "udp2tcp" {
+        return RELAY_TCP
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+            .map(transports::RelaySocket::Tcp);
+    }
+    RELAY
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+        .map(transports::RelaySocket::Udp)
 }
 
 #[no_mangle]
@@ -466,6 +552,9 @@ pub extern "C" fn mh_stats(out: *mut c_char, capacity: c_int) -> c_int {
 pub extern "C" fn mh_stop() {
     STOP.store(true, Ordering::SeqCst);
     if let Ok(mut guard) = RELAY.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = RELAY_TCP.lock() {
         *guard = None;
     }
     RELAY_FD.store(-1, Ordering::SeqCst);

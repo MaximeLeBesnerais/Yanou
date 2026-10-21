@@ -235,31 +235,42 @@ pub extern "C" fn mh_tunnel_start(
     // Everything that touches the tun or the reactor has to run inside the runtime:
     // `tun::AsyncDevice::new` registers the fd with the reactor and panics without one.
     let outcome = runtime().block_on(async move {
-        let Some(std_socket) = crate::take_relay_socket() else {
-            return Err::<_, String>(
-                "no relay socket: the extension must open and protect one first".into(),
-            );
+        let Some(socket) = crate::take_relay_socket(&transport_name) else {
+            return Err::<_, String>(format!(
+                "no relay socket for transport '{transport_name}': the extension must open \
+                 and protect one first"
+            ));
         };
-        if let Ok(local) = std_socket.local_addr() {
-            log_line(&format!("relay socket bound to {local}"));
-        }
+        let socket = match socket {
+            crate::transports::RelaySocket::Udp(std_socket) => {
+                if let Ok(local) = std_socket.local_addr() {
+                    log_line(&format!("relay socket bound to {local}"));
+                }
 
-        // The probe needs a blocking socket; tokio wants the opposite.
-        let _ = std_socket.set_nonblocking(false);
-        let _ = std_socket.set_read_timeout(Some(Duration::from_secs(1)));
-        let (sent, received) = probe_relay_socket(&std_socket);
-        log_line(&format!("self-test: dns query sent={sent} reply={received}"));
-        let tcp = probe_tcp(endpoint.ip(), 443);
-        log_line(&format!("self-test: tcp {}:443 {tcp}", endpoint.ip()));
-        std_socket
-            .set_nonblocking(true)
-            .map_err(|error| format!("relay socket nonblocking: {error}"))?;
+                // The probe needs a blocking socket; tokio wants the opposite.
+                let _ = std_socket.set_nonblocking(false);
+                let _ = std_socket.set_read_timeout(Some(Duration::from_secs(1)));
+                let (sent, received) = probe_relay_socket(&std_socket);
+                log_line(&format!("self-test: dns query sent={sent} reply={received}"));
+                let tcp = probe_tcp(endpoint.ip(), 443);
+                log_line(&format!("self-test: tcp {}:443 {tcp}", endpoint.ip()));
+                std_socket
+                    .set_nonblocking(true)
+                    .map_err(|error| format!("relay socket nonblocking: {error}"))?;
+                crate::transports::RelaySocket::Udp(std_socket)
+            }
+            // udp2tcp: the transport connects this socket itself, after protect(), so
+            // there is no UDP socket to probe with and the connect is the reachability
+            // test. `bind` logs whether it came up.
+            crate::transports::RelaySocket::Tcp(tcp_socket) => {
+                log_line("relay socket is TCP: udp2tcp connects it after protect()");
+                crate::transports::RelaySocket::Tcp(tcp_socket)
+            }
+        };
 
-        let udp_socket = tokio::net::UdpSocket::from_std(std_socket)
-            .map_err(|error| format!("relay socket: {error}"))?;
         // The relay's public key is the LWO obfuscation key; the other transports ignore it.
         let transport = TransportFactory::new(
-            udp_socket,
+            socket,
             endpoint,
             bridge,
             &transport_name,
