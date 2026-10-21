@@ -12,7 +12,10 @@ crate-type = ["cdylib"]
 # src/platform/ohos, which takes the fd the system vNIC hands back and wraps it in a
 # posix Tun. That is the same shape Android uses, only without JNI.
 tun = { version = "0.8.14", default-features = false, features = ["async"] }
-gotatun = { version = "0.10.1", default-features = false, features = ["aws-lc-rs", "device", "tun"] }
+# `daita` pulls in maybenot and adds `Peer::with_daita` plus the packet-shaping hooks
+# in `gotatun::device::daita`. DAITA is negotiated with the relay's config service
+# (see `src/daita.rs`) and applied to the ingress peer; without it the engine is unchanged.
+gotatun = { version = "0.10.1", default-features = false, features = ["aws-lc-rs", "daita", "device", "tun"] }
 ipnetwork = "0.21"
 base64 = "0.22"
 rand = "0.8"
