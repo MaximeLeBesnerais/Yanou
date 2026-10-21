@@ -324,3 +324,9 @@ the daemon and `VpnService` to the tunnel, and compares it with this client.
 GPL-3.0-or-later, as is the client this is derived from. See [`LICENSE`](LICENSE). The
 domain-fronting strategy, the transport design and much of the WireGuard configuration come
 from `mullvad/mullvadvpn-app` and remain under their authors' copyright.
+
+## Name
+
+"Yanshu" is 鼹鼠 (yǎnshǔ), Mandarin for "mole", which is also what "mullvad" means in
+Swedish. The name echoes the service this client connects to and does not imply any
+affiliation.
