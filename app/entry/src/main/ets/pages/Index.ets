@@ -15,7 +15,9 @@ import {
 } from '../api/MullvadApi';
 import { SessionStore } from '../api/SessionStore';
 import { SecureStore } from '../security/SecureStore';
-import { VpnPrefs, DEFAULT_PREFS, VpnSettings } from '../settings/VpnSettings';
+import {
+  VpnPrefs, DEFAULT_PREFS, VpnSettings, DnsMode, isValidDnsAddress, normalizeDnsAddress
+} from '../settings/VpnSettings';
 import { DiagEntry, DiagStatusCounts, parseDiagLog, statusCounts } from '../diagnostics/DiagLog';
 
 const DOMAIN = 0x0002;
@@ -181,6 +183,9 @@ struct Index {
   @State settingsReady: boolean = false;
   /** Protocol preference (`auto` / `direct` / `obfuscated`); the tunnel reads the same key. */
   @State protocolMode: string = 'auto';
+  /** Custom DNS editor: the field being typed and the validation message under it. */
+  @State dnsInput: string = '';
+  @State dnsError: string = '';
 
   onPageShow(): void {
     this.visible = true;
@@ -3848,6 +3853,125 @@ struct Index {
       });
   }
 
+  private setDnsModes(): DnsMode[] {
+    return ['auto', 'custom'];
+  }
+
+  private setDnsName(mode: DnsMode): string {
+    return mode === 'custom' ? 'Custom' : 'Automatic';
+  }
+
+  private setDnsHint(): string {
+    if (this.prefs.dnsMode !== 'custom') {
+      return 'Queries go to the tunnel resolver. Content blocking changes its address.';
+    }
+    if (this.prefs.customDns.length === 0) {
+      return 'Add at least one resolver; until then the tunnel resolver is used.';
+    }
+    return 'Queries go to these resolvers instead of the tunnel resolver.';
+  }
+
+  private setDnsMode(mode: DnsMode): void {
+    if (this.prefs.dnsMode === mode) {
+      return;
+    }
+    this.prefs.dnsMode = mode;
+    this.dnsError = '';
+    this.setPrefText('dnsMode', mode);
+  }
+
+  /** Adds the address in the field; empty, malformed and duplicate entries stay out. */
+  private setAddDns(): void {
+    const address: string = normalizeDnsAddress(this.dnsInput);
+    if (address.length === 0) {
+      this.dnsError = 'Enter an address.';
+      return;
+    }
+    if (!isValidDnsAddress(address)) {
+      this.dnsError = 'Not an IPv4 or IPv6 address.';
+      return;
+    }
+    if (this.prefs.customDns.indexOf(address) >= 0) {
+      this.dnsError = 'Already in the list.';
+      return;
+    }
+    // A new array, not a push: `prefs` is @State and only a first-level assignment
+    // re-renders the list.
+    this.prefs.customDns = this.prefs.customDns.concat([address]);
+    this.dnsInput = '';
+    this.dnsError = '';
+    this.setPrefText('customDns', JSON.stringify(this.prefs.customDns));
+  }
+
+  private setRemoveDns(address: string): void {
+    this.prefs.customDns = this.prefs.customDns.filter((item: string) => item !== address);
+    this.dnsError = '';
+    this.setPrefText('customDns', JSON.stringify(this.prefs.customDns));
+  }
+
+  private setBlockHint(): string {
+    return this.prefs.dnsMode === 'auto' ?
+      'The categories are combined into the tunnel resolver address.' :
+      'Only applies to automatic DNS; switch the mode above to use these.';
+  }
+
+  /** Reads one content-blocking switch by preference key. */
+  private setBlockValue(key: string): boolean {
+    if (key === 'blockAds') {
+      return this.prefs.blockAds;
+    }
+    if (key === 'blockTrackers') {
+      return this.prefs.blockTrackers;
+    }
+    if (key === 'blockMalware') {
+      return this.prefs.blockMalware;
+    }
+    if (key === 'blockAdult') {
+      return this.prefs.blockAdult;
+    }
+    if (key === 'blockGambling') {
+      return this.prefs.blockGambling;
+    }
+    return this.prefs.blockSocial;
+  }
+
+  /** One content-blocking switch; the six booleans share the preferences store. */
+  private setBlock(key: string, value: boolean): void {
+    if (key === 'blockAds') {
+      this.prefs.blockAds = value;
+    } else if (key === 'blockTrackers') {
+      this.prefs.blockTrackers = value;
+    } else if (key === 'blockMalware') {
+      this.prefs.blockMalware = value;
+    } else if (key === 'blockAdult') {
+      this.prefs.blockAdult = value;
+    } else if (key === 'blockGambling') {
+      this.prefs.blockGambling = value;
+    } else if (key === 'blockSocial') {
+      this.prefs.blockSocial = value;
+    }
+    this.setPref(key, value);
+  }
+
+  @Builder
+  blockRow(label: string, key: string) {
+    Row() {
+      Text(label)
+        .fontSize(15)
+        .fontColor($r('sys.color.font_primary'))
+      Blank()
+      Toggle({ type: ToggleType.Switch, isOn: this.setBlockValue(key) })
+        .selectedColor($r('sys.color.brand'))
+        .enabled(this.prefs.dnsMode === 'auto')
+        .onChange((value: boolean) => {
+          this.setBlock(key, value);
+        })
+    }
+    .width('100%')
+    .height(44)
+    .opacity(this.prefs.dnsMode === 'auto' ? 1 : 0.5)
+  }
+
   /** Copies the last diagnostics text the tunnel wrote; Settings only reads it. */
   private setCopyDiagnostics(): void {
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.logText);
@@ -3951,6 +4075,129 @@ struct Index {
             }
             .width('100%')
             .padding({ top: 12, bottom: 12 })
+
+            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+
+            Column({ space: 8 }) {
+              Text('DNS')
+                .fontSize(15)
+                .fontColor($r('sys.color.font_primary'))
+
+              Row({ space: 4 }) {
+                ForEach(this.setDnsModes(), (mode: DnsMode) => {
+                  Button(this.setDnsName(mode))
+                    .type(ButtonType.Normal)
+                    .layoutWeight(1)
+                    .height(34)
+                    .borderRadius(8)
+                    .fontSize(11)
+                    .padding({ left: 0, right: 0 })
+                    .backgroundColor(this.prefs.dnsMode === mode ?
+                      $r('sys.color.brand') : Color.Transparent)
+                    .fontColor(this.prefs.dnsMode === mode ?
+                      Color.White : $r('sys.color.font_secondary'))
+                    .onClick(() => {
+                      this.setDnsMode(mode);
+                    })
+                }, (mode: DnsMode) => mode)
+              }
+              .width('100%')
+              .padding(3)
+              .borderRadius(10)
+              .backgroundColor($r('sys.color.comp_background_secondary'))
+
+              Text(this.setDnsHint())
+                .fontSize(12)
+                .fontColor($r('sys.color.font_secondary'))
+                .width('100%')
+
+              if (this.prefs.dnsMode === 'custom') {
+                ForEach(this.prefs.customDns, (address: string) => {
+                  Row() {
+                    Text(address)
+                      .fontSize(15)
+                      .fontColor($r('sys.color.font_primary'))
+                      .layoutWeight(1)
+                    Button('Remove')
+                      .type(ButtonType.Capsule)
+                      .height(28)
+                      .fontSize(12)
+                      .padding({ left: 12, right: 12 })
+                      .backgroundColor($r('sys.color.comp_background_secondary'))
+                      .fontColor($r('sys.color.alert'))
+                      .onClick(() => {
+                        this.setRemoveDns(address);
+                      })
+                  }
+                  .width('100%')
+                  .height(40)
+                }, (address: string) => address)
+
+                Row({ space: 8 }) {
+                  TextInput({ placeholder: 'IPv4 or IPv6 address', text: this.dnsInput })
+                    .layoutWeight(1)
+                    .height(38)
+                    .fontSize(14)
+                    .backgroundColor($r('sys.color.comp_background_secondary'))
+                    .borderRadius(8)
+                    .placeholderColor($r('sys.color.font_tertiary'))
+                    .caretColor($r('sys.color.brand'))
+                    .onChange((value: string) => {
+                      this.dnsInput = value;
+                      this.dnsError = '';
+                    })
+                  Button('Add')
+                    .type(ButtonType.Capsule)
+                    .height(38)
+                    .fontSize(14)
+                    .padding({ left: 18, right: 18 })
+                    .backgroundColor($r('sys.color.brand'))
+                    .fontColor(Color.White)
+                    .onClick(() => {
+                      this.setAddDns();
+                    })
+                }
+                .width('100%')
+
+                if (this.dnsError.length > 0) {
+                  Text(this.dnsError)
+                    .fontSize(12)
+                    .fontColor($r('sys.color.alert'))
+                    .width('100%')
+                }
+              }
+            }
+            .width('100%')
+            .padding({ top: 12, bottom: 12 })
+            .alignItems(HorizontalAlign.Start)
+
+            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+
+            Column({ space: 4 }) {
+              Text('Content blocking')
+                .fontSize(15)
+                .fontColor($r('sys.color.font_primary'))
+              Text(this.setBlockHint())
+                .fontSize(12)
+                .fontColor($r('sys.color.font_secondary'))
+                .width('100%')
+                .margin({ bottom: 4 })
+
+              this.blockRow('Ads', 'blockAds')
+              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+              this.blockRow('Trackers', 'blockTrackers')
+              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+              this.blockRow('Malware', 'blockMalware')
+              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+              this.blockRow('Adult content', 'blockAdult')
+              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+              this.blockRow('Gambling', 'blockGambling')
+              Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+              this.blockRow('Social media', 'blockSocial')
+            }
+            .width('100%')
+            .padding({ top: 12, bottom: 6 })
+            .alignItems(HorizontalAlign.Start)
 
             Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
 
