@@ -1,4 +1,4 @@
-import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
+import { socket, vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import { Want } from '@kit.AbilityKit';
 import { commonEventManager, BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -21,6 +21,8 @@ const TAG = 'YanouVpn';
  */
 const TUN_GATEWAY: string = '10.64.0.1';
 const TUN_DNS: string = '10.64.0.1';
+/** Port of the relay's tunnel config service, which hands out DAITA machines. */
+const CONFIG_SERVICE_PORT: number = 1337;
 /** Base tun MTU: what a single-hop tunnel uses. */
 const TUN_MTU: number = 1420;
 /**
@@ -274,6 +276,33 @@ interface ExitSettings {
 }
 
 /**
+ * The DAITA peer the config service handed out. It is a throwaway session: the machines
+ * and the ephemeral key belong to one tunnel, and the private key is never persisted.
+ */
+interface DaitaPeerSettings {
+  /** Base64 preshared key, empty when the service returned none (DAITA alone). */
+  psk: string;
+  /** Base64 private key of the ephemeral peer registered with the relay. */
+  ephemeralKey: string;
+  /** Serialized maybenot machines, exactly as the service returned them. */
+  machines: string[];
+  maxPadding: number;
+  maxBlocking: number;
+}
+
+/** What `native.negotiateDaita` answers. */
+interface DaitaNegotiation {
+  ok: boolean;
+  error?: string;
+  psk?: string;
+  machines?: string[];
+  maxPadding?: number;
+  maxBlocking?: number;
+  ephemeralKey?: string;
+  ephemeralPublicKey?: string;
+}
+
+/**
  * The settings object `tunnelStart` takes: transport-specific keys and, when multihop is
  * on, the exit relay under `exit`. The core ignores keys it does not know.
  */
@@ -285,6 +314,13 @@ interface TransportSettings {
   token?: string;
   exit?: ExitSettings;
   sourceIpv4?: string;
+  /** DAITA keys, present only after a successful negotiation with the relay. */
+  daita?: boolean;
+  psk?: string;
+  ephemeralKey?: string;
+  machines?: string[];
+  maxPadding?: number;
+  maxBlocking?: number;
 }
 
 /**
@@ -359,6 +395,17 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
   private lastRebuildAt: number = 0;
   /** Why the tunnel was declared lost; republished every tick so the UI keeps it. */
   private lostReason: string = '';
+  /** DAITA preference, read once at setup; the relay list is already filtered by it. */
+  private daitaEnabled: boolean = false;
+  /** Settings from the config service; non-null once the tunnel carries DAITA. */
+  private daitaPeer: DaitaPeerSettings | undefined = undefined;
+  /** A negotiation is running, so the ticker must not start a second one. */
+  private daitaPending: boolean = false;
+  /** One negotiation per connection attempt: a relay that refuses is not retried forever. */
+  private daitaAttempted: boolean = false;
+  /** Relay and transport the live tunnel uses, so the DAITA restart can pin them. */
+  private activeCandidate: RelayCandidate | undefined = undefined;
+  private activeEntry: TransportDescriptor | undefined = undefined;
 
   onCreate(want: Want): void {
     hilog.info(DOMAIN, TAG, 'onCreate %{public}s', want.abilityName);
@@ -448,6 +495,8 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       // old choice. The addresses are re-validated here because one malformed entry
       // makes the system reject the whole VpnConfig.
       const prefs: VpnPrefs = await VpnSettings.load(this.context);
+      this.daitaEnabled = prefs.daita;
+      native.logLine(`daita: ${prefs.daita ? 'requested for this connection' : 'off'}`);
       const dns: DnsChoice = dnsChoice(prefs);
       const addresses: vpnExtension.LinkAddress[] = [
         { address: { address: tunAddress, family: 1 }, prefixLength: tunPrefix }
@@ -666,6 +715,16 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       // the entry relay knows belongs to this device, not the 10.64.0.1 gateway.
       settings.sourceIpv4 = this.sourceIpv4();
     }
+    // DAITA is added to this once-only settings object after a successful negotiation,
+    // so every attempt the restart makes carries the same ephemeral peer.
+    if (this.daitaPeer !== undefined) {
+      settings.daita = true;
+      settings.psk = this.daitaPeer.psk;
+      settings.ephemeralKey = this.daitaPeer.ephemeralKey;
+      settings.machines = this.daitaPeer.machines;
+      settings.maxPadding = this.daitaPeer.maxPadding;
+      settings.maxBlocking = this.daitaPeer.maxBlocking;
+    }
     return Object.keys(settings).length > 0 ? JSON.stringify(settings) : '';
   }
 
@@ -789,6 +848,9 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       this.endpoint = hostPort;
       this.handshakeMs = 0;
       this.attemptStartedAt = Date.now();
+      // The DAITA restart has to go back to the relay that handed out the machines.
+      this.activeCandidate = candidate;
+      this.activeEntry = entry;
 
       // udp2tcp rides a TCP stream and needs a TCP socket; every other transport sends
       // datagrams from a UDP socket. Either way the extension protects the fd it opened,
@@ -829,6 +891,10 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
           native.logLine(`engine mtu ${started['mtu']} · vNIC ${this.effectiveMtu()} · ` +
             `multihop ${started['multihop'] === true ? 'on' : 'off'}`);
         }
+        if (started['daita'] === true) {
+          const machines: number = this.daitaPeer !== undefined ? this.daitaPeer.machines.length : 0;
+          native.logLine(`daita: engine reports DAITA active (${machines} machine(s))`);
+        }
         return;
       }
       const reason: string = started['error'] !== undefined ? started['error'] as string : 'unknown';
@@ -840,6 +906,112 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
 
   private nextShadowsocksPort(): number {
     return SS_PORT_MIN + Math.floor(Math.random() * (SS_PORT_MAX - SS_PORT_MIN + 1));
+  }
+
+  /**
+   * Asks the relay's config service for a DAITA peer and restarts the tunnel with it.
+   *
+   * The TCP socket is deliberately **not** `protect()`ed: it has to enter the tun, which
+   * is the only route to `10.64.0.1:1337`. That also means this can only run once a
+   * tunnel is up, and the socket is closed before the restart tears that tunnel down.
+   *
+   * The config service is a plaintext gRPC endpoint; the request is built and parsed in
+   * the native core, and this method only owns the socket and the restart.
+   */
+  private async negotiateDaita(): Promise<void> {
+    native.logLine('daita: negotiating with the relay config service');
+    const tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
+    try {
+      await tcp.connect({
+        address: { address: TUN_GATEWAY, family: 1, port: CONFIG_SERVICE_PORT },
+        timeout: 10000
+      });
+      const fd: number = await tcp.getSocketFd();
+      native.logLine(`daita: config service socket fd ${fd} (unprotected, routed into the tunnel)`);
+      const raw: string = await native.negotiateDaita(fd, this.publicKey, '');
+      const result: DaitaNegotiation = JSON.parse(raw) as DaitaNegotiation;
+      if (result.ok !== true) {
+        const message: string = result.error !== undefined ? result.error : 'unknown error';
+        native.logLine(`daita: negotiation failed · ${message}`);
+        // The user asked for DAITA by switching the toggle on; a tunnel that silently
+        // runs without it would be a privacy downgrade, so fail this connection instead.
+        this.fail(`DAITA negotiation failed: ${message}`);
+        return;
+      }
+      const machines: string[] = result.machines !== undefined && result.machines !== null ?
+        result.machines : [];
+      const maxPadding: number = result.maxPadding !== undefined ? result.maxPadding : 0;
+      const maxBlocking: number = result.maxBlocking !== undefined ? result.maxBlocking : 0;
+      if (machines.length === 0) {
+        native.logLine('daita: relay returned no machines; failing this connection');
+        this.fail('DAITA negotiation failed: the relay returned no machines. ' +
+          'Pick a DAITA relay or turn the toggle off.');
+        return;
+      }
+      const ephemeralKey: string = result.ephemeralKey !== undefined ? result.ephemeralKey : '';
+      if (ephemeralKey.length === 0) {
+        native.logLine('daita: no ephemeral key in the result; failing this connection');
+        this.fail('DAITA negotiation failed: the relay did not return an ephemeral peer key.');
+        return;
+      }
+      const psk: string = result.psk !== undefined && result.psk !== null ? result.psk : '';
+      native.logLine(`daita: relay returned ${machines.length} machine(s) · ` +
+        `maxPadding ${maxPadding} · maxBlocking ${maxBlocking} · ` +
+        `psk ${psk.length > 0 ? 'set' : 'not set'}`);
+      this.daitaPeer = {
+        psk: psk,
+        ephemeralKey: ephemeralKey,
+        machines: machines,
+        maxPadding: maxPadding,
+        maxBlocking: maxBlocking
+      };
+      this.restartWithDaita();
+    } catch (e) {
+      const err = e as BusinessError;
+      native.logLine(`daita: negotiation failed · ${err.code ?? -1}: ${err.message ?? 'unknown'}`);
+      this.fail(`DAITA negotiation failed: ${err.message ?? 'unknown error'}`);
+    } finally {
+      this.daitaPending = false;
+      try {
+        await tcp.close();
+      } catch (e) {
+        const err = e as BusinessError;
+        hilog.warn(DOMAIN, TAG, 'daita socket close: %{public}d', err.code ?? -1);
+      }
+    }
+  }
+
+  /**
+   * Rebuilds the tunnel on the relay that handed out the DAITA machines.
+   *
+   * The ephemeral peer exists only on that relay, so the ladder is pinned to the live
+   * candidate and transport. The engine took ownership of the previous relay socket, so
+   * the normal `startCandidate` path opens and protects a new one.
+   */
+  private restartWithDaita(): void {
+    const candidate: RelayCandidate | undefined = this.activeCandidate;
+    const entry: TransportDescriptor | undefined = this.activeEntry;
+    if (candidate === undefined || entry === undefined) {
+      native.logLine('daita: no active relay to restart on');
+      this.fail('DAITA negotiation failed: no active relay to restart on.');
+      return;
+    }
+    native.logLine(`daita: restarting with the ephemeral peer on ${candidate.hostname} ` +
+      `(${entry.id})`);
+    native.tunnelStop();
+    this.candidates = [candidate];
+    this.ladder = [entry];
+    this.candidateIndex = 0;
+    this.portIndex = 0;
+    this.udp2tcpPortIndex = 0;
+    this.phase = 'connecting';
+    this.connectStartedAt = Date.now();
+    this.attemptStartedAt = Date.now();
+    this.handshakeMs = 0;
+    this.lastProgress = -1;
+    this.lastProgressAt = 0;
+    this.publish();
+    this.startCandidate();
   }
 
   /**
@@ -919,6 +1091,14 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
         this.startCandidate();
       }
     } else if (this.phase === 'connected') {
+      // DAITA is negotiated on a live tunnel: the config service is only reachable
+      // through the tun, and the restart replaces this tunnel with the shaped one.
+      if (this.daitaEnabled && this.daitaPeer === undefined && !this.daitaPending &&
+        !this.daitaAttempted) {
+        this.daitaPending = true;
+        this.daitaAttempted = true;
+        this.negotiateDaita();
+      }
       // Nothing used to watch a live tunnel, so a dead one kept reporting "connected"
       // and the user only found out when a page refused to load.
       this.supervise();
@@ -1059,6 +1239,11 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
     this.lastProgress = -1;
     this.lastProgressAt = 0;
     this.lostReason = '';
+    this.daitaPeer = undefined;
+    this.daitaPending = false;
+    this.daitaAttempted = false;
+    this.activeCandidate = undefined;
+    this.activeEntry = undefined;
     // Nothing is dialled any more; an idle payload must not describe the last attempt.
     this.transport = '';
     this.family = '';

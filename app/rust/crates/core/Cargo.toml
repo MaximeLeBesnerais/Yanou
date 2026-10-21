@@ -12,7 +12,10 @@ crate-type = ["cdylib"]
 # src/platform/ohos, which takes the fd the system vNIC hands back and wraps it in a
 # posix Tun. That is the same shape Android uses, only without JNI.
 tun = { version = "0.8.14", default-features = false, features = ["async"] }
-gotatun = { version = "0.10.1", default-features = false, features = ["aws-lc-rs", "device", "tun"] }
+# `daita` pulls in maybenot and adds `Peer::with_daita` plus the packet-shaping hooks
+# in `gotatun::device::daita`. DAITA is negotiated with the relay's config service
+# (see `src/daita.rs`) and applied to the ingress peer; without it the engine is unchanged.
+gotatun = { version = "0.10.1", default-features = false, features = ["aws-lc-rs", "daita", "device", "tun"] }
 ipnetwork = "0.21"
 base64 = "0.22"
 rand = "0.8"
@@ -27,6 +30,11 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "tokio"] }
 http = "1"
 http-body-util = "0.1"
+# The relay config service is gRPC over plaintext HTTP/2; h2 is already in the lock
+# through hyper/h3, so the DAITA client costs one direct dependency and no new tree.
+h2 = "0.4"
+# `dup` for the config service socket: the extension's TCPSocket owns the original fd.
+libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 serde = { version = "1", features = ["derive"] }

@@ -8,12 +8,14 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
+use gotatun::device::daita::{DaitaSettings, Machine};
 use gotatun::device::{Device, DeviceBuilder, DeviceTransports, Peer};
 use gotatun::noise::TimerParams;
 use gotatun::packet::{Ip, Ipv4Header, Ipv6Header, Packet, PacketBufPool, UdpHeader, WgData};
@@ -47,6 +49,10 @@ static JOBS: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new());
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 /// True while the running tunnel is the two-device multihop chain.
 static MULTIHOP: AtomicBool = AtomicBool::new(false);
+/// True when the running tunnel has DAITA shaping attached to its far-end peer.
+static DAITA_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Number of maybenot machines attached to the running DAITA peer.
+static DAITA_MACHINES: AtomicU64 = AtomicU64::new(0);
 /// MTU the engine actually configured, after the second WireGuard header is removed.
 static EFFECTIVE_MTU: AtomicU64 = AtomicU64::new(0);
 
@@ -123,6 +129,115 @@ struct TunnelSettings {
     /// gateway (`10.64.0.1`) is a different address.
     #[serde(default, rename = "sourceIpv4")]
     source_ipv4: Option<String>,
+    /// DAITA: traffic shaping driven by machines the relay's config service hands out.
+    /// The extension only sets this after a successful negotiation; absent means off.
+    #[serde(default)]
+    daita: bool,
+    /// Serialized maybenot machines, exactly as the config service returned them.
+    #[serde(default)]
+    machines: Vec<String>,
+    /// Largest fraction of bandwidth the machines may spend on decoy packets.
+    #[serde(default, rename = "maxPadding")]
+    max_padding: f64,
+    /// Largest fraction of bandwidth the machines may spend on delayed packets.
+    #[serde(default, rename = "maxBlocking")]
+    max_blocking: f64,
+    /// Base64 preshared key the config service derived for this ephemeral peer. A
+    /// DAITA-only negotiation has none, so it is optional.
+    #[serde(default)]
+    psk: Option<String>,
+    /// Base64 private key of the ephemeral WireGuard peer registered with the relay.
+    /// The public half was what the config service saw; without this key the device
+    /// cannot complete the handshake the service prepared.
+    #[serde(default, rename = "ephemeralKey")]
+    ephemeral_key: Option<String>,
+}
+
+/// A parsed DAITA request, ready to be attached to the peer that terminates the tunnel.
+#[derive(Debug)]
+struct DaitaConfig {
+    settings: DaitaSettings,
+    /// Number of machines, kept for the diagnostics line without walking the settings.
+    machines: usize,
+    /// Optional WireGuard preshared key for this peer.
+    psk: Option<[u8; 32]>,
+    /// Private key of the ephemeral peer; required when DAITA is on.
+    ephemeral_key: [u8; 32],
+}
+
+/// Validates one fraction the config service returned.
+fn daita_fraction(name: &str, value: f64) -> Result<f64, String> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("DAITA {name} must be a fraction between 0 and 1, got {value}"))
+    }
+}
+
+/// Turns the DAITA keys into what `Peer::with_daita` takes.
+///
+/// DAITA without machines would silently do nothing, so that is an error: the caller has
+/// to notice a relay that answered without a configuration instead of pretending the
+/// traffic is shaped.
+fn resolve_daita(settings: &TunnelSettings) -> Result<Option<DaitaConfig>, String> {
+    if !settings.daita {
+        return Ok(None);
+    }
+    if settings.machines.is_empty() {
+        return Err(
+            "DAITA was requested but the relay returned no maybenot machines; refusing to \
+             start without traffic shaping"
+                .to_string(),
+        );
+    }
+    let machines = settings
+        .machines
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            raw.parse::<Machine>()
+                .map_err(|error| format!("DAITA machine {}: {error}", index + 1))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let max_decoy_frac = daita_fraction("maxPadding", settings.max_padding)?;
+    let max_delay_frac = daita_fraction("maxBlocking", settings.max_blocking)?;
+    // The config service registered an ephemeral peer for the key it was given, so the
+    // tunnel has to handshake with that private key. Without it the handshake would use
+    // the account key, which the relay has just unloaded in favour of the ephemeral peer.
+    let ephemeral_key = match settings
+        .ephemeral_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(encoded) => decode_key(encoded, "DAITA ephemeral key")?,
+        None => {
+            return Err(
+                "DAITA was requested but no ephemeral peer key was supplied; the relay \
+                 registered a peer this device cannot use"
+                    .to_string(),
+            )
+        }
+    };
+    // DAITA alone does not produce a PSK, so its absence is normal; a malformed one is not.
+    let psk = match settings.psk.as_deref().map(str::trim).filter(|text| !text.is_empty()) {
+        Some(encoded) => Some(decode_key(encoded, "DAITA PSK")?),
+        None => None,
+    };
+    let count = machines.len();
+    Ok(Some(DaitaConfig {
+        settings: DaitaSettings {
+            maybenot_machines: machines,
+            max_decoy_frac,
+            max_delay_frac,
+            // The same tunables upstream's `talpid-tunnel-config-client` uses.
+            max_delayed_packets: NonZeroUsize::new(1024).expect("1024 is non-zero"),
+            min_delay_capacity: 50,
+        },
+        machines: count,
+        psk,
+        ephemeral_key,
+    }))
 }
 
 /// The exit relay of a multihop chain, exactly as the UI selected it.
@@ -234,6 +349,24 @@ fn make_peer(
         peer = peer.dangerously_with_timer_params(timers);
     }
     peer
+}
+
+/// Attaches the negotiated DAITA settings (and PSK) to a peer.
+///
+/// DAITA shapes the traffic between this device and the relay it negotiated with: the
+/// only relay in single hop, the exit relay in multihop. That is also where the
+/// ephemeral peer was registered, so the settings never go to a multihop entry peer.
+fn with_daita(peer: Peer, daita: Option<&DaitaConfig>) -> Peer {
+    match daita {
+        Some(daita) => {
+            let mut peer = peer.with_daita(daita.settings.clone());
+            if let Some(psk) = daita.psk {
+                peer = peer.with_preshared_key(psk);
+            }
+            peer
+        }
+        None => peer,
+    }
 }
 
 /// Traffic counters and the oldest session of one device.
@@ -429,6 +562,27 @@ pub extern "C" fn mh_tunnel_start(
             return write_out(out, capacity, &json!({"ok": false, "error": error}).to_string())
         }
     };
+    let daita = match resolve_daita(&parsed_settings) {
+        Ok(daita) => daita,
+        Err(error) => {
+            return write_out(out, capacity, &json!({"ok": false, "error": error}).to_string())
+        }
+    };
+    if let Some(daita) = daita.as_ref() {
+        log_line(&format!(
+            "tunnel: daita on, {} maybenot machine(s), max padding {:.3}, max blocking {:.3}, \
+             psk {}, ephemeral peer key present",
+            daita.machines,
+            daita.settings.max_decoy_frac,
+            daita.settings.max_delay_frac,
+            if daita.psk.is_some() { "set" } else { "not set" }
+        ));
+    }
+    // The config service at 10.64.0.1 is answered by the relay at the far end of the
+    // tunnel being built: the only relay in single hop, and the exit relay in multihop.
+    // DAITA therefore belongs to that peer — the ephemeral key and its PSK attach there,
+    // while a multihop entry device keeps the registered account key.
+    let daita_secret = daita.as_ref().map(|daita| daita.ephemeral_key).unwrap_or(secret_bytes);
     let multihop = exit_peer.is_some();
     let source_v4 = parse_source_v4(&parsed_settings.source_ipv4);
     let requested_mtu = mtu as u16;
@@ -462,6 +616,7 @@ pub extern "C" fn mh_tunnel_start(
         guard.clear();
     }
     log_line(&format!("tunnel: starting to {endpoint}"));
+    let daita_machines = daita.as_ref().map(|daita| daita.machines);
 
     // Everything that touches the tun or the reactor has to run inside the runtime:
     // `tun::AsyncDevice::new` registers the fd with the reactor and panics without one.
@@ -556,7 +711,8 @@ pub extern "C" fn mh_tunnel_start(
                     vec![IpNetwork::from(exit.endpoint.ip())],
                     peer_timers,
                 );
-                let exit_config = make_peer(exit.key, exit.endpoint, allowed_ips, None);
+                let exit_config =
+                    with_daita(make_peer(exit.key, exit.endpoint, allowed_ips, None), daita.as_ref());
                 let exit_key = exit.key;
                 let channel_mtu = entry_mtu.unwrap_or(effective_mtu);
                 log_line(&format!(
@@ -566,6 +722,11 @@ pub extern "C" fn mh_tunnel_start(
                     "tunnel: entry {endpoint}, exit {}",
                     exit.endpoint
                 ));
+                if daita.is_some() {
+                    log_line(
+                        "tunnel: daita attached to the exit peer (the relay that answered 10.64.0.1)",
+                    );
+                }
 
                 let (tun_tx, tun_rx, udp_channels) = new_udp_tun_channel(
                     PACKET_CHANNEL_CAPACITY,
@@ -578,7 +739,7 @@ pub extern "C" fn mh_tunnel_start(
                     DeviceBuilder::new()
                         .with_udp(udp_channels)
                         .with_ip(ObservedTun { inner: tun_device })
-                        .with_private_key(StaticSecret::from(secret_bytes))
+                        .with_private_key(StaticSecret::from(daita_secret))
                         .with_peer(exit_config)
                         .build()
                         .await
@@ -672,13 +833,16 @@ pub extern "C" fn mh_tunnel_start(
             }
             None => {
                 // Single hop: exactly the device this module built before multihop.
-                let relay = make_peer(relay_key, endpoint, allowed_ips, peer_timers);
+                let relay = with_daita(
+                    make_peer(relay_key, endpoint, allowed_ips, peer_timers),
+                    daita.as_ref(),
+                );
 
                 let device = Arc::new(
                     DeviceBuilder::new()
                         .with_ip(ObservedTun { inner: tun_device })
                         .with_udp(transport)
-                        .with_private_key(StaticSecret::from(secret_bytes))
+                        .with_private_key(StaticSecret::from(daita_secret))
                         .with_peer(relay)
                         .build()
                         .await
@@ -758,6 +922,11 @@ pub extern "C" fn mh_tunnel_start(
         Ok(jobs) => {
             RUNNING.store(true, Ordering::SeqCst);
             note_started();
+            if let Some(machines) = daita_machines {
+                log_line(&format!("tunnel: daita active with {machines} machine(s)"));
+                DAITA_ACTIVE.store(true, Ordering::SeqCst);
+                DAITA_MACHINES.store(machines as u64, Ordering::SeqCst);
+            }
             if let Ok(mut guard) = JOBS.lock() {
                 *guard = jobs;
             }
@@ -769,6 +938,7 @@ pub extern "C" fn mh_tunnel_start(
                     "endpoint": endpoint.to_string(),
                     "multihop": multihop,
                     "mtu": effective_mtu,
+                    "daita": daita_machines.is_some(),
                 })
                 .to_string(),
             )
@@ -791,6 +961,8 @@ fn stop_running() -> bool {
     }
     RUNNING.store(false, Ordering::SeqCst);
     MULTIHOP.store(false, Ordering::SeqCst);
+    DAITA_ACTIVE.store(false, Ordering::SeqCst);
+    DAITA_MACHINES.store(0, Ordering::SeqCst);
     EFFECTIVE_MTU.store(0, Ordering::SeqCst);
     stopped
 }
@@ -828,6 +1000,8 @@ pub extern "C" fn mh_tunnel_status(out: *mut c_char, capacity: c_int) -> c_int {
         "txBytes": TX_BYTES.load(Ordering::Relaxed),
         "handshakeAgeMs": HANDSHAKE_AGE_MS.load(Ordering::Relaxed),
         "multihop": MULTIHOP.load(Ordering::SeqCst),
+        "daita": DAITA_ACTIVE.load(Ordering::SeqCst),
+        "daitaMachines": DAITA_MACHINES.load(Ordering::SeqCst),
         "mtu": EFFECTIVE_MTU.load(Ordering::SeqCst),
         "error": error,
     });
@@ -909,5 +1083,87 @@ mod tests {
         );
         let settings = parse_settings(&raw).expect("settings parse");
         assert!(resolve_exit(&settings).expect("exit parse").is_some());
+    }
+
+    /// The "no-op" machine from the maybenot crate's own documentation.
+    const DAITA_MACHINE: &str = "02eNpjYEAHjOgCAAA0AAI=";
+
+    #[test]
+    fn daita_is_off_by_default() {
+        let settings = parse_settings("{}").expect("settings parse");
+        assert!(resolve_daita(&settings).expect("no daita").is_none());
+    }
+
+    #[test]
+    fn daita_settings_parse_machines_and_fractions() {
+        let ephemeral = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let psk = base64::engine::general_purpose::STANDARD.encode([3u8; 32]);
+        let raw = format!(
+            r#"{{"daita":true,"machines":["{DAITA_MACHINE}"],"maxPadding":0.25,"maxBlocking":0.75,"ephemeralKey":"{ephemeral}","psk":"{psk}"}}"#
+        );
+        let settings = parse_settings(&raw).expect("settings parse");
+        let daita = resolve_daita(&settings).expect("daita parse").expect("some daita");
+        assert_eq!(daita.machines, 1);
+        assert_eq!(daita.settings.max_decoy_frac, 0.25);
+        assert_eq!(daita.settings.max_delay_frac, 0.75);
+        assert_eq!(daita.ephemeral_key, [9u8; 32]);
+        assert_eq!(daita.psk, Some([3u8; 32]));
+    }
+
+    #[test]
+    fn daita_psk_is_optional() {
+        let ephemeral = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let raw = format!(
+            r#"{{"daita":true,"machines":["{DAITA_MACHINE}"],"maxPadding":0.0,"maxBlocking":0.0,"ephemeralKey":"{ephemeral}"}}"#
+        );
+        let settings = parse_settings(&raw).expect("settings parse");
+        let daita = resolve_daita(&settings).expect("daita parse").expect("some daita");
+        assert_eq!(daita.psk, None);
+    }
+
+    #[test]
+    fn daita_requires_the_ephemeral_peer_key() {
+        let raw = format!(
+            r#"{{"daita":true,"machines":["{DAITA_MACHINE}"],"maxPadding":0.0,"maxBlocking":0.0}}"#
+        );
+        let settings = parse_settings(&raw).expect("settings parse");
+        let error = resolve_daita(&settings).expect_err("daita without ephemeral key");
+        assert!(error.contains("no ephemeral peer key"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn daita_without_machines_fails_loudly() {
+        let settings = parse_settings(r#"{"daita":true}"#).expect("settings parse");
+        let error = resolve_daita(&settings).expect_err("daita without machines");
+        assert!(error.contains("no maybenot machines"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn daita_rejects_an_unparseable_machine() {
+        let settings = parse_settings(r#"{"daita":true,"machines":["not-a-machine"]}"#)
+            .expect("settings parse");
+        assert!(resolve_daita(&settings).is_err());
+    }
+
+    #[test]
+    fn daita_rejects_a_malformed_psk() {
+        let ephemeral = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let raw = format!(
+            r#"{{"daita":true,"machines":["{DAITA_MACHINE}"],"maxPadding":0.0,"maxBlocking":0.0,"ephemeralKey":"{ephemeral}","psk":"not-base64"}}"#
+        );
+        let settings = parse_settings(&raw).expect("settings parse");
+        assert!(resolve_daita(&settings).is_err());
+    }
+
+    #[test]
+    fn daita_rejects_fractions_outside_the_unit_interval() {
+        let ephemeral = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        for fraction in ["-0.1", "1.5"] {
+            let raw = format!(
+                r#"{{"daita":true,"machines":["{DAITA_MACHINE}"],"ephemeralKey":"{ephemeral}","maxPadding":{fraction}}}"#
+            );
+            let settings = parse_settings(&raw).expect("settings parse");
+            assert!(resolve_daita(&settings).is_err(), "accepted {fraction}");
+        }
     }
 }
