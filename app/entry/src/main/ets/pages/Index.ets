@@ -3821,14 +3821,19 @@ struct Index {
       .width('100%')
       .padding({ left: 4, right: 4 })
 
-      Row({ space: 8 }) {
-        ForEach(this.diagFilters(), (filter: string) => {
-          chip(this.diagChipLabel(filter), this.diagFilter === filter, () => {
-            this.diagFilter = filter;
-          })
-        }, (filter: string) => filter)
+      Scroll() {
+        Row({ space: 8 }) {
+          ForEach(this.diagFilters(), (filter: string) => {
+            chip(this.diagChipLabel(filter), this.diagFilter === filter, () => {
+              this.diagFilter = filter;
+            })
+          }, (filter: string) => filter)
+        }
       }
       .width('100%')
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .align(Alignment.Start)
 
       Scroll() {
         Column() {
@@ -4102,20 +4107,26 @@ struct Index {
 
         Column() {
           Row() {
+            // The label gives way first: a masked number plus two icons does not fit 360 dp
+            // together with the full word, and a truncated label is cheaper than a row that
+            // pushes the eye off the card.
             Text('Account number')
               .fontSize(15)
               .fontColor($r('sys.color.font_primary'))
-            Blank()
-            Text(this.revealAccount ? (this.session?.account ?? '') :
-              maskAccount(this.session?.account ?? ''))
-              .fontSize(15)
+              .layoutWeight(1)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+            Text(this.revealAccount ? (this.session?.account ?? '') : this.accountValue())
+              .fontSize(this.revealAccount ? 14 : 15)
               .fontColor($r('sys.color.font_secondary'))
+              .maxLines(1)
+              .margin({ left: 8 })
             Row() {
               SymbolGlyph(this.revealAccount ? $r('sys.symbol.eye_slash') : $r('sys.symbol.eye'))
                 .fontSize(18)
                 .fontColor([$r('sys.color.font_secondary')])
             }
-            .width(44)
+            .width(40)
             .height(44)
             .justifyContent(FlexAlign.Center)
             .onClick(() => {
@@ -4127,7 +4138,7 @@ struct Index {
                 .fontSize(18)
                 .fontColor([$r('sys.color.font_secondary')])
             }
-            .width(44)
+            .width(40)
             .height(44)
             .justifyContent(FlexAlign.Center)
             .onClick(() => {

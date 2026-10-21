@@ -554,9 +554,11 @@ more than a switch has its own destination:
 | Account | account number, expiry, this device, device list with Manage, sign out |
 | About | client-not-service text, version, licence, source |
 
-The main screen fits a 360x640 dp window without scrolling. 360 dp was checked on the tablet
-by rendering the whole app in a 360x640 frame (a temporary constant, removed again), then
-the same screens were checked full size.
+The main screen fits a 360x640 dp window without scrolling. Every screen was checked on the
+tablet at 360x640 dp by rendering the whole app in a frame of that size (a temporary
+constant, removed again), then checked full size. The account row was the one real casualty:
+a masked number plus two icons overflowed, so the label gives way and the number shows its
+last four digits until the eye is tapped.
 
 The pass also fixed things the UI was hiding:
 
@@ -579,4 +581,3 @@ Still open:
   720 vp column on a tablet.
 - Accessibility labels on the `SymbolGlyph`-only buttons.
 - MTU control and per-app routing, which need core support first.
-- Diagnostics, Account and About have not been re-checked at 360 dp, only at tablet width.
