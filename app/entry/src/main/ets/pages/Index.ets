@@ -3523,6 +3523,20 @@ struct Index {
     const hosts: string[] = ['example.com', 'doubleclick.net', 'googlesyndication.com'];
     native.setDiagnostics(this.diagnosticsEnabled);
     native.logLine(`dns check: tunnel resolver ${this.dnsLabel()}`);
+    try {
+      const net: connection.NetHandle = connection.getDefaultNetSync();
+      const props: connection.ConnectionProperties =
+        connection.getConnectionPropertiesSync(net);
+      const dnses: string[] = [];
+      for (const entry of props.dnses) {
+        dnses.push(entry.address);
+      }
+      native.logLine(`dns check: default net ${net.netId} ` +
+        `dnses [${dnses.join(', ')}]`);
+    } catch (e) {
+      const err = e as BusinessError;
+      native.logLine(`dns check: default net lookup failed (${err.code ?? -1})`);
+    }
     const gatewayProbe: string = await this.probeResolver('10.64.0.1');
     native.logLine(`dns check: 10.64.0.1:53 -> ${gatewayProbe}`);
     const chosen: string = this.dnsLabel().split(',')[0].trim();
