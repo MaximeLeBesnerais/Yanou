@@ -1,4 +1,4 @@
-import native from 'libmuharmony.so';
+import native from 'libyanshu.so';
 import { fileIo as fs } from '@kit.CoreFileKit';
 
 /**

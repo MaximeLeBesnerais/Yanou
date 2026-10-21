@@ -1,11 +1,11 @@
 {
   "name": "entry",
   "version": "1.0.0",
-  "description": "MuHarmony: VPN extension, native tunnel core and UI",
+  "description": "Yanshu: VPN extension, native tunnel core and UI",
   "main": "",
   "author": "",
   "license": "",
   "dependencies": {
-    "libmuharmony.so": "file:./src/main/cpp/types/libmuharmony"
+    "libyanshu.so": "file:./src/main/cpp/types/libyanshu"
   }
 }

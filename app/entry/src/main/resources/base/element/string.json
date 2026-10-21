@@ -6,23 +6,23 @@
     },
     {
       "name": "module_desc",
-      "value": "MuHarmony VPN client"
+      "value": "Yanshu VPN client"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "MuHarmony"
+      "value": "Yanshu"
     },
     {
       "name": "EntryAbility_label",
-      "value": "MuHarmony"
+      "value": "Yanshu"
     },
     {
       "name": "vpn_ability_label",
-      "value": "MuHarmony tunnel"
+      "value": "Yanshu tunnel"
     },
     {
       "name": "vpn_tunnel_reason",
-      "value": "Routes device traffic through the MuHarmony tunnel"
+      "value": "Routes device traffic through the Yanshu tunnel"
     }
   ]
 }

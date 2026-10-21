@@ -1,4 +1,4 @@
-//! Native tunnel core for MuHarmony.
+//! Native tunnel core for Yanshu.
 //!
 //! Scope of this build: prove the pipe the rest of the port depends on — that the fd
 //! returned by `VpnConnection.create` can be read by Rust, that a default route into
@@ -94,7 +94,7 @@ pub(crate) fn diagnostics_enabled() -> bool {
     DIAGNOSTICS.load(Ordering::Relaxed)
 }
 
-/// Appends one line to `muharmony-native.log`, only while diagnostics are enabled.
+/// Appends one line to `yanshu-native.log`, only while diagnostics are enabled.
 fn log_line(message: &str) {
     if !diagnostics_enabled() {
         return;
@@ -117,7 +117,7 @@ fn write_line(line: &str) {
     if dir.is_empty() {
         return;
     }
-    let path = format!("{dir}/muharmony-native.log");
+    let path = format!("{dir}/yanshu-native.log");
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{line}");
     }

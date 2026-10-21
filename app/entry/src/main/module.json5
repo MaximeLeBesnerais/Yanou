@@ -18,7 +18,7 @@
         "usedScene": {
           "abilities": [
             "EntryAbility",
-            "MuharmonyVpnAbility"
+            "YanshuVpnAbility"
           ],
           "when": "always"
         }
@@ -58,7 +58,7 @@
     ],
     "extensionAbilities": [
       {
-        "name": "MuharmonyVpnAbility",
+        "name": "YanshuVpnAbility",
         "srcEntry": "./ets/vpn/VpnExtensionAbility.ets",
         "label": "$string:vpn_ability_label",
         "description": "$string:vpn_tunnel_reason",

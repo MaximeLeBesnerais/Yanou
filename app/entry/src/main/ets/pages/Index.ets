@@ -6,7 +6,7 @@ import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import native from 'libmuharmony.so';
+import native from 'libyanshu.so';
 import { VpnStatePayload, parseVpnState, VPN_STATE_EVENT } from '../common/VpnEvents';
 import {
   Session, WireGuardKey, DeviceResponse, ApiError, login, accountData,
@@ -19,10 +19,10 @@ import { VpnPrefs, DEFAULT_PREFS, VpnSettings } from '../settings/VpnSettings';
 import { DiagEntry, DiagStatusCounts, parseDiagLog, statusCounts } from '../diagnostics/DiagLog';
 
 const DOMAIN = 0x0002;
-const TAG = 'MuHarmonyUi';
+const TAG = 'YanshuUi';
 
 const VPN_BUNDLE: string = 'com.maxime.muharmony';
-const VPN_ABILITY: string = 'MuharmonyVpnAbility';
+const VPN_ABILITY: string = 'YanshuVpnAbility';
 
 const CARD_RADIUS: number = 16;
 const PAGE_GUTTER: number = 16;
@@ -478,7 +478,7 @@ struct Index {
   }
 
   private readLogs(): void {
-    const path: string = `${getContext(this).filesDir}/muharmony-native.log`;
+    const path: string = `${getContext(this).filesDir}/yanshu-native.log`;
     try {
       if (!fs.accessSync(path)) {
         this.logText = '';
@@ -596,19 +596,19 @@ struct Index {
       buttons.push({ title: 'Reconnect', wantAgent: reconnect });
     }
 
-    let title: string = 'MuHarmony';
+    let title: string = 'Yanshu';
     let text: string = '';
     if (this.phase === 'connected') {
-      title = 'MuHarmony · Connected';
+      title = 'Yanshu · Connected';
       text = this.tunnelTarget.length > 0 ? this.tunnelTarget : this.relayLabel();
     } else if (this.phase === 'connecting') {
-      title = 'MuHarmony · Connecting';
+      title = 'Yanshu · Connecting';
       text = this.tunnelTarget.length > 0 ? this.tunnelTarget : this.relayLabel();
     } else if (this.phase === 'lost') {
-      title = 'MuHarmony · Connection lost';
+      title = 'Yanshu · Connection lost';
       text = this.retrying ? 'Trying to reconnect…' : 'Reconnect to protect traffic again';
     } else if (this.phase === 'failed') {
-      title = 'MuHarmony · Connection failed';
+      title = 'Yanshu · Connection failed';
       text = this.errorText.length > 0 ? this.errorText : 'The tunnel did not come up';
     }
 
@@ -651,7 +651,7 @@ struct Index {
       content: {
         notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
         normal: {
-          title: 'MuHarmony could not reconnect',
+          title: 'Yanshu could not reconnect',
           text: 'No relay answered. Open the app to try again.'
         }
       },
@@ -1334,7 +1334,7 @@ struct Index {
     // The tunnel runs in its own process and survives the UI process. Reopening the app must
     // not tear a healthy tunnel down and dial again, which is what the reconnect-on-open was.
     if (this.phase === 'connected' || this.phase === 'connecting') {
-      hilog.info(0x0000, 'MuHarmony', 'startTunnel skipped: already %{public}s', this.phase);
+      hilog.info(0x0000, 'Yanshu', 'startTunnel skipped: already %{public}s', this.phase);
       return;
     }
     if (this.busy) {
@@ -1503,7 +1503,7 @@ struct Index {
     Column() {
       Row() {
         Column({ space: 2 }) {
-          Text('MuHarmony')
+          Text('Yanshu')
             .fontSize(28)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_primary'))
@@ -1640,7 +1640,7 @@ struct Index {
     Column() {
       Row() {
         Column({ space: 2 }) {
-          Text('MuHarmony')
+          Text('Yanshu')
             .fontSize(22)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_primary'))
@@ -2962,7 +2962,7 @@ struct Index {
 
   private async exportLogs(): Promise<void> {
     try {
-      const options: picker.DocumentSaveOptions = { newFileNames: ['muharmony-diagnostics.txt'] };
+      const options: picker.DocumentSaveOptions = { newFileNames: ['yanshu-diagnostics.txt'] };
       const documentPicker = new picker.DocumentViewPicker(getContext(this) as common.Context);
       const uris: string[] = await documentPicker.save(options);
       if (uris.length === 0) {
@@ -2986,7 +2986,7 @@ struct Index {
     const section: string = `=== ${entry.target} · ${entry.startedLabel} ===\n${entry.body}`;
     try {
       const options: picker.DocumentSaveOptions = {
-        newFileNames: [`muharmony-${entry.target}.txt`]
+        newFileNames: [`yanshu-${entry.target}.txt`]
       };
       const documentPicker = new picker.DocumentViewPicker(getContext(this) as common.Context);
       const uris: string[] = await documentPicker.save(options);
@@ -3959,7 +3959,7 @@ struct Index {
 
         Column() {
           Row() {
-            Text('MuHarmony')
+            Text('Yanshu')
               .fontSize(15)
               .fontColor($r('sys.color.font_primary'))
             Blank()

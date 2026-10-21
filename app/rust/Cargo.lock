@@ -1302,31 +1302,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "muharmony-core"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "domain-fronting",
- "gotatun",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "ipnetwork",
- "rand 0.8.8",
- "rustls",
- "serde",
- "serde_json",
- "shadowsocks",
- "tokio",
- "tokio-rustls",
- "tun",
- "webpki-roots",
- "x25519-dalek",
-]
-
-[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2480,6 +2455,31 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "zeroize",
+]
+
+[[package]]
+name = "yanshu-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "domain-fronting",
+ "gotatun",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ipnetwork",
+ "rand 0.8.8",
+ "rustls",
+ "serde",
+ "serde_json",
+ "shadowsocks",
+ "tokio",
+ "tokio-rustls",
+ "tun",
+ "webpki-roots",
+ "x25519-dalek",
 ]
 
 [[package]]

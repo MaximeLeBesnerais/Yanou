@@ -1,0 +1,6 @@
+{
+  "name": "libyanshu.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "Type surface of the Yanshu NAPI bridge"
+}
