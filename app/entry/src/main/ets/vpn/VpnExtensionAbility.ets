@@ -983,7 +983,7 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
     // The config service drops connections for no visible reason now and then: one
     // negotiation returns 722 bytes, the next closes the stream after ~14 s. A fresh
     // socket and a retry is cheaper than failing the whole connection on the first try.
-    const attempts: number = 3;
+    const attempts: number = 5;
     let lastError: string = 'unknown error';
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const tcp: socket.TCPSocket = socket.constructTCPSocketInstance();

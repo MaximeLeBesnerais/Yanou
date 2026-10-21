@@ -83,6 +83,24 @@ dns check: default net 219 dnses [202.113.15.2, 202.113.5.6, 2001:250:400:659::3
 The default network carrying the Wi-Fi resolvers is why the resolver had to move into the
 tunnel: `VpnConfig.dnsAddresses` is never consulted.
 
+## 4c. Transports on the wire
+
+Forced-ladder runs (a scratch build whose `TRANSPORTS` table has one transport) are the only
+way to dial a rung on a network that answers `direct` first:
+
+- **LWO**: ladder of only `lwo-v4`/`lwo-v6` connected to `sg-sin-wg-102` in 922 ms.
+- **QUIC/MASQUE**: ladder of only `quic-v4`/`quic-v6` connected to the same relay in 4421 ms.
+- **udp2tcp**: the transport is selected and dialled (`attempt 26 · …:443 · ipv6 · udp2tcp`)
+  but no stream is established, so nothing is sent. `udp2tcp` is the one rung not verified on
+  a device. The API publishes no udp2tcp ports — the client uses the official client's
+  `[80, 443, 5001]` — and TCP to those ports does not establish from this network. That is
+  all the evidence there is: a probe from the Mac was worthless because that machine cannot
+  open outbound TCP at all.
+
+LWO and QUIC rungs are gated on the relay list advertising the feature, so a cached list
+written before those fields existed leaves them dead until the cache is refetched; the app
+now treats such a cache as stale.
+
 ## 5. DAITA
 
 Settings → DAITA on, then connect to a relay that advertises it.
