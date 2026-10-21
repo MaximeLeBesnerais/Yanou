@@ -25,6 +25,25 @@ transport. Both paths are described in [Architecture](#architecture).
 Tested on a Huawei MatePad (TGR-W00), HarmonyOS 6.1, SDK API 26, `compatibleSdkVersion
 6.1.1(24)`. Only `arm64-v8a` is built.
 
+## Screens
+
+<p align="center">
+  <img src="docs/screens/login.jpeg" width="49%" alt="Sign-in screen: account number only">
+  <img src="docs/screens/connected.jpeg" width="49%" alt="Connected to a Mullvad relay">
+</p>
+
+Sign-in takes an account number you already hold and nothing else. Once connected, the home
+screen shows the relay, the handshake time, the counters and the device IP version the
+tunnel is running with.
+
+<p align="center">
+  <img src="docs/screens/about.jpeg" width="70%" alt="About screen with the disclosure text">
+</p>
+
+The About screen repeats the disclosure in the app: a client, not a service, not affiliated
+with Mullvad, and a warning that anyone selling a subscription through a third party is a
+scam.
+
 ## Features
 
 - Sign-in with an account number, device registration through the Mullvad API, and key
