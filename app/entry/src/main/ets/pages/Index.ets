@@ -1,5 +1,5 @@
 import { vpnExtension } from '@kit.NetworkKit';
-import { commonEventManager, BusinessError, pasteboard } from '@kit.BasicServicesKit';
+import { commonEventManager, BusinessError, pasteboard, zlib } from '@kit.BasicServicesKit';
 import { common, Want, wantAgent, WantAgent } from '@kit.AbilityKit';
 import { promptAction } from '@kit.ArkUI';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
@@ -25,6 +25,28 @@ const TAG = 'YanouUi';
 
 const VPN_BUNDLE: string = 'com.maxime.muharmony';
 const VPN_ABILITY: string = 'YanouVpnAbility';
+
+/** Shown in exports and the About screen; bump it with the HAP version. */
+const APP_VERSION: string = '0.1.0';
+
+/** One file inside a diagnostics export. */
+interface DiagManifestFile {
+  name: string;
+  target: string;
+  startedAt: string;
+  status: string;
+  lines: number;
+}
+
+/** `manifest.json` at the root of a diagnostics zip. */
+interface DiagManifest {
+  app: string;
+  version: string;
+  exportedAt: string;
+  entryCount: number;
+  nodes: string[];
+  files: DiagManifestFile[];
+}
 
 const CARD_RADIUS: number = 16;
 const PAGE_GUTTER: number = 16;
@@ -579,6 +601,37 @@ struct Index {
   }
 
   /** MTU the extension will configure: one header less for multihop, floored at 1280. */
+  /**
+   * Resolver the tunnel will use, mirroring what the extension puts in
+   * `VpnConfig.dnsAddresses`: the custom list when one is set, otherwise a blocking
+   * resolver encoded as `100.64.0.<mask>` or the default `10.64.0.1`.
+   */
+  private dnsLabel(): string {
+    if (this.prefs.dnsMode === 'custom' && this.prefs.customDns.length > 0) {
+      return this.prefs.customDns.join(', ');
+    }
+    let mask: number = 0;
+    if (this.prefs.blockAds) {
+      mask |= 1;
+    }
+    if (this.prefs.blockTrackers) {
+      mask |= 2;
+    }
+    if (this.prefs.blockMalware) {
+      mask |= 4;
+    }
+    if (this.prefs.blockAdult) {
+      mask |= 8;
+    }
+    if (this.prefs.blockGambling) {
+      mask |= 16;
+    }
+    if (this.prefs.blockSocial) {
+      mask |= 32;
+    }
+    return mask === 0 ? '10.64.0.1' : `100.64.0.${mask}`;
+  }
+
   private effectiveMtu(): number {
     if (!this.multihopActive()) {
       return TUN_MTU;
@@ -1930,37 +1983,24 @@ struct Index {
       .alignItems(VerticalAlign.Center)
 
       // Outside the card, so a lost or failed tunnel stays visible while the page scrolls.
-      if (this.phase === 'lost' || this.phase === 'failed') {
+      if (this.phase === 'lost') {
         Row({ space: 8 }) {
           SymbolGlyph($r('sys.symbol.exclamationmark_triangle'))
             .fontSize(18)
             .fontColor([$r('sys.color.alert')])
-          Text(this.phase === 'lost' ?
-            (this.retrying ? 'Connection lost — reconnecting…' : 'Connection lost') :
-            'Connection failed')
+          Text(this.retrying ? 'Connection lost — reconnecting…' : 'Connection lost')
             .fontSize(13)
             .fontWeight(FontWeight.Medium)
             .fontColor($r('sys.color.alert'))
             .layoutWeight(1)
-          if (this.phase === 'lost') {
-            Text('Reconnect')
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('sys.color.brand'))
-              .padding({ left: 8, top: 4, bottom: 4 })
-              .onClick(() => {
-                this.reconnectTunnel();
-              })
-          } else {
-            Text('Open diagnostics')
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('sys.color.brand'))
-              .padding({ left: 8, top: 4, bottom: 4 })
-              .onClick(() => {
-                this.pageStack.pushPath({ name: 'logs' });
-              })
-          }
+          Text('Reconnect')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.brand'))
+            .padding({ left: 8, top: 4, bottom: 4 })
+            .onClick(() => {
+              this.reconnectTunnel();
+            })
         }
         .width('100%')
         .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 10, bottom: 10 })
@@ -2159,7 +2199,8 @@ struct Index {
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('sys.color.font_secondary'))
-            Text(`vNIC ${this.session?.ipv4 ?? '-'} · MTU ${this.effectiveMtu()} · DNS 10.64.0.1`)
+            Text(`vNIC ${this.session?.ipv4 ?? '-'} · MTU ${this.effectiveMtu()} · ` +
+              `DNS ${this.dnsLabel()}`)
               .fontSize(13)
               .fontColor($r('sys.color.font_tertiary'))
             Text(`${this.ipModeLabel()} · kill switch ${this.prefs.killSwitch ? 'on' : 'off'}`)
@@ -3300,43 +3341,203 @@ struct Index {
     })
   }
 
-  private async exportLogs(): Promise<void> {
+  private two(value: number): string {
+    return value < 10 ? `0${value}` : `${value}`;
+  }
+
+  /** `20261021-232000`, used in file and zip names. */
+  private stampFilename(): string {
+    const d = new Date();
+    return `${d.getFullYear()}${this.two(d.getMonth() + 1)}${this.two(d.getDate())}-` +
+      `${this.two(d.getHours())}${this.two(d.getMinutes())}${this.two(d.getSeconds())}`;
+  }
+
+  /** `2026-10-21 23:20:00`, used inside the exported text. */
+  private stampHuman(): string {
+    const d = new Date();
+    return `${d.getFullYear()}-${this.two(d.getMonth() + 1)}-${this.two(d.getDate())} ` +
+      `${this.two(d.getHours())}:${this.two(d.getMinutes())}:${this.two(d.getSeconds())}`;
+  }
+
+  /** Local `20261021-232000` for an entry's ISO start, or `legacy` when it has none. */
+  private entryStamp(entry: DiagEntry): string {
+    const at: number = Date.parse(entry.startedAt);
+    if (isNaN(at)) {
+      return 'legacy';
+    }
+    const d = new Date(at);
+    return `${d.getFullYear()}${this.two(d.getMonth() + 1)}${this.two(d.getDate())}-` +
+      `${this.two(d.getHours())}${this.two(d.getMinutes())}${this.two(d.getSeconds())}`;
+  }
+
+  /** `003-sg-sin-wg-001-20261021-232000.txt`: sortable, and says what is inside. */
+  private entryFilename(entry: DiagEntry, index: number): string {
+    const safe: string = entry.target.replace(/[^A-Za-z0-9._-]+/g, '-')
+      .replace(/^-+/, '').replace(/-+$/, '');
+    const host: string = safe.length > 0 ? safe : 'unknown';
+    const number: string = index < 10 ? `00${index}` : (index < 100 ? `0${index}` : `${index}`);
+    return `${number}-${host}-${this.entryStamp(entry)}.txt`;
+  }
+
+  /** Header block every exported entry starts with. */
+  private entryHeader(entry: DiagEntry, index: number, total: number, exportedAt: string): string {
+    const duration: string = entry.duration.length > 0 ? entry.duration : '-';
+    const started: string = entry.startedAt.length > 0 ? entry.startedAt : 'unknown';
+    return [
+      '=== 燕鸥 (Yàn\'ōu) diagnostics ===',
+      `app        燕鸥 (Yàn'ōu) ${APP_VERSION}`,
+      `exported   ${exportedAt}`,
+      `entry      ${index} of ${total}`,
+      `target     ${entry.target}`,
+      `started    ${started} (${entry.startedLabel})`,
+      `status     ${entry.statusLabel}`,
+      `summary    ${entry.summary}`,
+      `duration   ${duration}`,
+      `attempts   ${entry.attempts}`,
+      `lines      ${entry.lineCount}`,
+      '---',
+      ''
+    ].join('\n');
+  }
+
+  /** Every distinct relay or country label the exported entries tried. */
+  private diagNodes(): string[] {
+    const seen: string[] = [];
+    for (const entry of this.diagEntries) {
+      if (entry.target.length > 0 && !seen.includes(entry.target)) {
+        seen.push(entry.target);
+      }
+    }
+    return seen;
+  }
+
+  /** Writes a string to a picked document URI. */
+  private async saveText(uri: string, text: string): Promise<void> {
+    const file = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    fs.writeSync(file.fd, text);
+    fs.closeSync(file);
+  }
+
+  /** Copies a file to a picked document URI in chunks; the picker gives a content URI. */
+  private async saveFile(uri: string, path: string): Promise<void> {
+    const src = fs.openSync(path, fs.OpenMode.READ_ONLY);
+    const dst = fs.openSync(uri, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    const buffer: ArrayBuffer = new ArrayBuffer(64 * 1024);
+    let read: number = fs.readSync(src.fd, buffer);
+    while (read > 0) {
+      fs.writeSync(dst.fd, buffer, { length: read });
+      read = fs.readSync(src.fd, buffer);
+    }
+    fs.closeSync(src);
+    fs.closeSync(dst);
+  }
+
+  /** The whole native log as one text file, for when the entries are not enough. */
+  private async diagExportRaw(): Promise<void> {
     try {
-      const options: picker.DocumentSaveOptions = { newFileNames: ['yanou-diagnostics.txt'] };
+      const name: string = `yanou-log-${this.stampFilename()}.txt`;
+      const options: picker.DocumentSaveOptions = { newFileNames: [name] };
       const documentPicker = new picker.DocumentViewPicker(getContext(this) as common.Context);
       const uris: string[] = await documentPicker.save(options);
       if (uris.length === 0) {
         return;
       }
-      const file = fs.openSync(uris[0],
-        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(file.fd, this.logText);
-      fs.closeSync(file);
+      await this.saveText(uris[0], this.logText);
     } catch (e) {
       this.logText = `Export failed: ${JSON.stringify(e)}`;
     }
   }
 
-  /** Saves the open entry on its own, with a section header the parser can read back. */
+  /**
+   * Every parsed entry as its own file, plus a manifest, inside one zip.
+   *
+   * The files are named so a folder sorts chronologically and each name says which relay
+   * and which attempt it is; the manifest lists them and the relays they used, so a report
+   * can be read without opening every file.
+   */
+  private async diagExportZip(): Promise<void> {
+    if (this.diagEntries.length === 0) {
+      this.logText = 'Nothing to export yet. Connect once with diagnostics on.';
+      return;
+    }
+    const context = getContext(this) as common.Context;
+    const exportedAt: string = this.stampHuman();
+    const stamp: string = this.stampFilename();
+    const dir: string = `${context.cacheDir}/diag-${stamp}`;
+    try {
+      fs.mkdirSync(dir);
+      const paths: string[] = [];
+      const files: DiagManifestFile[] = [];
+      let index: number = 0;
+      for (const entry of this.diagEntries) {
+        index += 1;
+        const name: string = this.entryFilename(entry, index);
+        const path: string = `${dir}/${name}`;
+        const text: string = this.entryHeader(entry, index, this.diagEntries.length, exportedAt) +
+          entry.body + '\n';
+        await this.saveText(path, text);
+        paths.push(path);
+        files.push({
+          name: name,
+          target: entry.target,
+          startedAt: entry.startedAt,
+          status: entry.status,
+          lines: entry.lineCount
+        });
+      }
+      const manifest: DiagManifest = {
+        app: '燕鸥 (Yàn\'ōu)',
+        version: APP_VERSION,
+        exportedAt: exportedAt,
+        entryCount: files.length,
+        nodes: this.diagNodes(),
+        files: files
+      };
+      const manifestPath: string = `${dir}/manifest.json`;
+      await this.saveText(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+      paths.push(manifestPath);
+
+      const zipName: string = `yanou-diagnostics-${stamp}.zip`;
+      const zipPath: string = `${context.cacheDir}/${zipName}`;
+      const options: zlib.Options = {
+        level: zlib.CompressLevel.COMPRESS_LEVEL_DEFAULT_COMPRESSION,
+        memLevel: zlib.MemLevel.MEM_LEVEL_DEFAULT,
+        strategy: zlib.CompressStrategy.COMPRESS_STRATEGY_DEFAULT_STRATEGY
+      };
+      await zlib.compressFiles(paths, zipPath, options);
+
+      const saveOptions: picker.DocumentSaveOptions = { newFileNames: [zipName] };
+      const documentPicker = new picker.DocumentViewPicker(context);
+      const uris: string[] = await documentPicker.save(saveOptions);
+      if (uris.length === 0) {
+        return;
+      }
+      await this.saveFile(uris[0], zipPath);
+    } catch (e) {
+      this.logText = `Export failed: ${JSON.stringify(e)}`;
+    }
+  }
+
+  /** Saves the open entry with the same header the zip uses. */
   private async diagExportEntry(): Promise<void> {
     const entry: DiagEntry | null = this.openEntry;
     if (entry === null) {
       return;
     }
-    const section: string = `=== ${entry.target} · ${entry.startedLabel} ===\n${entry.body}`;
     try {
+      const index: number = Math.max(0, this.diagEntries.indexOf(entry)) + 1;
+      const total: number = this.diagEntries.length > 0 ? this.diagEntries.length : 1;
+      const section: string = this.entryHeader(entry, index, total, this.stampHuman()) +
+        entry.body + '\n';
       const options: picker.DocumentSaveOptions = {
-        newFileNames: [`yanou-${entry.target}.txt`]
+        newFileNames: [`yanou-${this.entryFilename(entry, index)}`]
       };
       const documentPicker = new picker.DocumentViewPicker(getContext(this) as common.Context);
       const uris: string[] = await documentPicker.save(options);
       if (uris.length === 0) {
         return;
       }
-      const file = fs.openSync(uris[0],
-        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      fs.writeSync(file.fd, section);
-      fs.closeSync(file);
+      await this.saveText(uris[0], section);
     } catch (e) {
       // Keep the list and the raw log intact: a failed save must not look like a log read.
       hilog.warn(DOMAIN, TAG, 'entry export failed %{public}s', JSON.stringify(e));
@@ -3625,15 +3826,24 @@ struct Index {
       .scrollBar(BarState.Off)
       .align(Alignment.TopStart)
 
-      Row() {
-        Button('Export as text')
+      Row({ space: 8 }) {
+        Button('Export all (zip)')
           .type(ButtonType.Capsule)
-          .width('100%')
+          .layoutWeight(1)
+          .height(44)
+          .backgroundColor($r('sys.color.brand'))
+          .fontColor($r('sys.color.font_on_primary'))
+          .onClick(() => {
+            this.diagExportZip();
+          })
+        Button('Raw log')
+          .type(ButtonType.Capsule)
+          .layoutWeight(1)
           .height(44)
           .backgroundColor($r('sys.color.comp_background_secondary'))
           .fontColor($r('sys.color.font_primary'))
           .onClick(() => {
-            this.exportLogs();
+            this.diagExportRaw();
           })
       }
       .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, bottom: PAGE_GUTTER })
