@@ -1,11 +1,11 @@
 {
   "name": "entry",
   "version": "1.0.0",
-  "description": "Yanshu: VPN extension, native tunnel core and UI",
+  "description": "Yanou: VPN extension, native tunnel core and UI",
   "main": "",
   "author": "",
   "license": "",
   "dependencies": {
-    "libyanshu.so": "file:./src/main/cpp/types/libyanshu"
+    "libyanou.so": "file:./src/main/cpp/types/libyanou"
   }
 }

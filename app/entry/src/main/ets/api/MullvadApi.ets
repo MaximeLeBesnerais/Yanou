@@ -1,4 +1,4 @@
-import native from 'libyanshu.so';
+import native from 'libyanou.so';
 import { fileIo as fs } from '@kit.CoreFileKit';
 
 /**

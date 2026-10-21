@@ -6,23 +6,23 @@
     },
     {
       "name": "module_desc",
-      "value": "Yanshu VPN client"
+      "value": "燕鸥 (Yàn'ōu): WireGuard client for HarmonyOS"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "Yanshu"
+      "value": "燕鸥 (Yàn'ōu)"
     },
     {
       "name": "EntryAbility_label",
-      "value": "Yanshu"
+      "value": "燕鸥"
     },
     {
       "name": "vpn_ability_label",
-      "value": "Yanshu tunnel"
+      "value": "燕鸥 VPN"
     },
     {
       "name": "vpn_tunnel_reason",
-      "value": "Routes device traffic through the Yanshu tunnel"
+      "value": "Routes device traffic through the 燕鸥 tunnel"
     }
   ]
 }

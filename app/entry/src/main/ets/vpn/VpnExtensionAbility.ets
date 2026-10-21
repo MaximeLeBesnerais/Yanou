@@ -2,7 +2,7 @@ import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import { Want } from '@kit.AbilityKit';
 import { commonEventManager, BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import native from 'libyanshu.so';
+import native from 'libyanou.so';
 import { WireGuardKey } from '../api/MullvadApi';
 import {
   VpnStatePayload, TunnelStatus, parseTunnelStats, parseTunnelStatus, VPN_STATE_EVENT
@@ -10,7 +10,7 @@ import {
 import { VpnSettings } from '../settings/VpnSettings';
 
 const DOMAIN = 0x0001;
-const TAG = 'YanshuVpn';
+const TAG = 'YanouVpn';
 
 /**
  * Gateway of tunnel subnet. It is the DNS server and the config service, and it is NOT
@@ -84,7 +84,7 @@ interface RelayCandidate {
   publicKey: string;
 }
 
-export default class YanshuVpnAbility extends VpnExtensionAbility {
+export default class YanouVpnAbility extends VpnExtensionAbility {
   private connection: vpnExtension.VpnConnection | undefined = undefined;
   private tunnelFd: number = -1;
   private udpFd: number = -1;

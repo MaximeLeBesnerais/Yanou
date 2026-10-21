@@ -6,7 +6,7 @@ import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import native from 'libyanshu.so';
+import native from 'libyanou.so';
 import { VpnStatePayload, parseVpnState, VPN_STATE_EVENT } from '../common/VpnEvents';
 import {
   Session, WireGuardKey, DeviceResponse, ApiError, login, accountData,
@@ -19,10 +19,10 @@ import { VpnPrefs, DEFAULT_PREFS, VpnSettings } from '../settings/VpnSettings';
 import { DiagEntry, DiagStatusCounts, parseDiagLog, statusCounts } from '../diagnostics/DiagLog';
 
 const DOMAIN = 0x0002;
-const TAG = 'YanshuUi';
+const TAG = 'YanouUi';
 
 const VPN_BUNDLE: string = 'com.maxime.muharmony';
-const VPN_ABILITY: string = 'YanshuVpnAbility';
+const VPN_ABILITY: string = 'YanouVpnAbility';
 
 const CARD_RADIUS: number = 16;
 const PAGE_GUTTER: number = 16;
@@ -478,7 +478,7 @@ struct Index {
   }
 
   private readLogs(): void {
-    const path: string = `${getContext(this).filesDir}/yanshu-native.log`;
+    const path: string = `${getContext(this).filesDir}/yanou-native.log`;
     try {
       if (!fs.accessSync(path)) {
         this.logText = '';
@@ -596,19 +596,19 @@ struct Index {
       buttons.push({ title: 'Reconnect', wantAgent: reconnect });
     }
 
-    let title: string = 'Yanshu';
+    let title: string = 'Yanou';
     let text: string = '';
     if (this.phase === 'connected') {
-      title = 'Yanshu · Connected';
+      title = '燕鸥 · Connected';
       text = this.tunnelTarget.length > 0 ? this.tunnelTarget : this.relayLabel();
     } else if (this.phase === 'connecting') {
-      title = 'Yanshu · Connecting';
+      title = '燕鸥 · Connecting';
       text = this.tunnelTarget.length > 0 ? this.tunnelTarget : this.relayLabel();
     } else if (this.phase === 'lost') {
-      title = 'Yanshu · Connection lost';
+      title = '燕鸥 · Connection lost';
       text = this.retrying ? 'Trying to reconnect…' : 'Reconnect to protect traffic again';
     } else if (this.phase === 'failed') {
-      title = 'Yanshu · Connection failed';
+      title = '燕鸥 · Connection failed';
       text = this.errorText.length > 0 ? this.errorText : 'The tunnel did not come up';
     }
 
@@ -651,7 +651,7 @@ struct Index {
       content: {
         notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
         normal: {
-          title: 'Yanshu could not reconnect',
+          title: '燕鸥 could not reconnect',
           text: 'No relay answered. Open the app to try again.'
         }
       },
@@ -1334,7 +1334,7 @@ struct Index {
     // The tunnel runs in its own process and survives the UI process. Reopening the app must
     // not tear a healthy tunnel down and dial again, which is what the reconnect-on-open was.
     if (this.phase === 'connected' || this.phase === 'connecting') {
-      hilog.info(0x0000, 'Yanshu', 'startTunnel skipped: already %{public}s', this.phase);
+      hilog.info(0x0000, 'Yanou', 'startTunnel skipped: already %{public}s', this.phase);
       return;
     }
     if (this.busy) {
@@ -1503,11 +1503,11 @@ struct Index {
     Column() {
       Row() {
         Column({ space: 2 }) {
-          Text('Yanshu')
+          Text('燕鸥')
             .fontSize(28)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_primary'))
-          Text('Privacy-first VPN')
+          Text("Yàn'ōu · WireGuard client")
             .fontSize(13)
             .fontColor($r('sys.color.font_secondary'))
         }
@@ -1628,9 +1628,118 @@ struct Index {
       .width('100%')
       .scrollBar(BarState.Off)
       .align(Alignment.TopStart)
+
+      Text('Not endorsed by Mullvad VPN AB. This app is only a client.')
+        .fontSize(11)
+        .fontColor($r('sys.color.font_tertiary'))
+        .textAlign(TextAlign.Center)
+        .width('100%')
+        .padding({ top: 8, bottom: 12 })
+        .onClick(() => {
+          this.pageStack.pushPath({ name: 'about' });
+        })
     }
     .width('100%')
     .height('100%')
+  }
+
+  // ---------------------------------------------------------------- about
+
+  @Builder
+  aboutScreen() {
+    Scroll() {
+      Column({ space: 18 }) {
+        Column({ space: 4 }) {
+          Text('燕鸥')
+            .fontSize(26)
+            .fontWeight(FontWeight.Bold)
+            .fontColor($r('sys.color.font_primary'))
+          Text("Yàn'ōu · WireGuard client for HarmonyOS NEXT")
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'))
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+
+        Column({ space: 6 }) {
+          Text('This app is a client, not a service')
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
+          Text('It has no servers, no subscription and no account of its own. It signs in with a ' +
+            'Mullvad account you already hold and connects to Mullvad relays with the WireGuard ' +
+            'protocol, through the API Mullvad publishes.')
+            .fontSize(14)
+            .lineHeight(21)
+            .fontColor($r('sys.color.font_secondary'))
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+
+        Column({ space: 6 }) {
+          Text('Why it exists')
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
+          Text('Mullvad does not provide an official client for HarmonyOS, so this app fills that ' +
+            'gap. It is an unofficial student project, not a company, and it is not affiliated ' +
+            'with, endorsed by or supported by Mullvad VPN AB.')
+            .fontSize(14)
+            .lineHeight(21)
+            .fontColor($r('sys.color.font_secondary'))
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+
+        Column({ space: 6 }) {
+          Text('If anyone sold you a subscription')
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
+          Text('This app never sells subscriptions or accounts. If anyone sold you "Mullvad access", ' +
+            'a subscription or an account through this app or through any other third party, you ' +
+            'were scammed. Mullvad accounts are sold only by Mullvad, at mullvad.net.')
+            .fontSize(14)
+            .lineHeight(21)
+            .fontColor($r('sys.color.font_secondary'))
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+
+        Column({ space: 6 }) {
+          Text('Terms')
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
+          Text('There are no terms of service: this is not a service. The app is provided as is, ' +
+            'under the GPL-3.0-or-later licence, and based on the open-source client from ' +
+            'mullvad/mullvadvpn-app.')
+            .fontSize(14)
+            .lineHeight(21)
+            .fontColor($r('sys.color.font_secondary'))
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+
+        Button('Close')
+          .type(ButtonType.Capsule)
+          .height(40)
+          .width('100%')
+          .fontSize(15)
+          .backgroundColor($r('sys.color.comp_background_secondary'))
+          .fontColor($r('sys.color.brand'))
+          .onClick(() => {
+            this.pageStack.pop();
+          })
+      }
+      .width('100%')
+      .padding({ left: PAGE_GUTTER, right: PAGE_GUTTER, top: 12, bottom: 24 })
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .height('100%')
+    .scrollBar(BarState.Off)
+    .align(Alignment.TopStart)
   }
 
   // ---------------------------------------------------------------- main
@@ -1640,7 +1749,7 @@ struct Index {
     Column() {
       Row() {
         Column({ space: 2 }) {
-          Text('Yanshu')
+          Text('燕鸥')
             .fontSize(22)
             .fontWeight(FontWeight.Bold)
             .fontColor($r('sys.color.font_primary'))
@@ -2962,7 +3071,7 @@ struct Index {
 
   private async exportLogs(): Promise<void> {
     try {
-      const options: picker.DocumentSaveOptions = { newFileNames: ['yanshu-diagnostics.txt'] };
+      const options: picker.DocumentSaveOptions = { newFileNames: ['yanou-diagnostics.txt'] };
       const documentPicker = new picker.DocumentViewPicker(getContext(this) as common.Context);
       const uris: string[] = await documentPicker.save(options);
       if (uris.length === 0) {
@@ -2986,7 +3095,7 @@ struct Index {
     const section: string = `=== ${entry.target} · ${entry.startedLabel} ===\n${entry.body}`;
     try {
       const options: picker.DocumentSaveOptions = {
-        newFileNames: [`yanshu-${entry.target}.txt`]
+        newFileNames: [`yanou-${entry.target}.txt`]
       };
       const documentPicker = new picker.DocumentViewPicker(getContext(this) as common.Context);
       const uris: string[] = await documentPicker.save(options);
@@ -3904,6 +4013,30 @@ struct Index {
 
             Row() {
               Column({ space: 2 }) {
+                Text('About')
+                  .fontSize(15)
+                  .fontColor($r('sys.color.font_primary'))
+                Text('Client, not a service · not endorsed by Mullvad')
+                  .fontSize(12)
+                  .fontColor($r('sys.color.font_secondary'))
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(16)
+                .fontColor([$r('sys.color.font_tertiary')])
+            }
+            .width('100%')
+            .height(60)
+            .onClick(() => {
+              this.pageStack.pushPath({ name: 'about' });
+            })
+
+            Divider().strokeWidth(0.5).color($r('sys.color.comp_divider'))
+
+            Row() {
+              Column({ space: 2 }) {
                 Text('DAITA')
                   .fontSize(15)
                   .fontColor($r('sys.color.font_primary'))
@@ -3959,7 +4092,7 @@ struct Index {
 
         Column() {
           Row() {
-            Text('Yanshu')
+            Text('燕鸥')
               .fontSize(15)
               .fontColor($r('sys.color.font_primary'))
             Blank()
@@ -4043,6 +4176,8 @@ struct Index {
             this.accountScreen()
           } else if (name === 'settings') {
             this.settingsScreen()
+          } else if (name === 'about') {
+            this.aboutScreen()
           }
         }
         .width('100%')
@@ -4057,7 +4192,8 @@ struct Index {
     .title(name === 'devices' ? 'Devices' :
       (name === 'servers' ? 'Servers' :
         (name === 'logs' ? 'Diagnostics' :
-          (name === 'entry' ? 'Connection' : (name === 'account' ? 'Account' : 'VPN settings')))))
+          (name === 'entry' ? 'Connection' :
+            (name === 'account' ? 'Account' : (name === 'about' ? 'About' : 'VPN settings'))))))
     .backgroundColor($r('sys.color.background_secondary'))
   }
 

@@ -26,6 +26,6 @@ fi
 
 BASE=/storage/media/100/local/files/Docs
 for dir in "${BASE}/Download" "${BASE}/Documents" "${BASE}"; do
-  "${HDC}" -t "${DEVICE}" file send "${HAP}" "${dir}/Yanshu-signed.hap" >/dev/null
-  echo "${dir}/Yanshu-signed.hap"
+  "${HDC}" -t "${DEVICE}" file send "${HAP}" "${dir}/Yanou-signed.hap" >/dev/null
+  echo "${dir}/Yanou-signed.hap"
 done

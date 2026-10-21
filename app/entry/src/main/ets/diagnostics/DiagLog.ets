@@ -1,5 +1,5 @@
 /**
- * Turns `yanshu-native.log` into one entry per connection attempt.
+ * Turns `yanou-native.log` into one entry per connection attempt.
  *
  * The native core starts every attempt with a marker line:
  *

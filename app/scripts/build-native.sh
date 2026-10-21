@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the Yanshu native core for OpenHarmony and stages it into entry/libs/<abi>.
+# Builds the Yanou native core for OpenHarmony and stages it into entry/libs/<abi>.
 #
 # The NDK ships clang wrappers named after the Rust target triple; each carries its own
 # --target and --sysroot, which is also why the same wrapper is the C compiler below.
@@ -12,7 +12,7 @@ case "$abi" in
   *) echo "only arm64-v8a is wired up" >&2; exit 1 ;;
 esac
 
-ndk=${YANSHU_OHOS_NDK:-/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native}
+ndk=${YANOU_OHOS_NDK:-/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native}
 compiler="$ndk/llvm/bin/${rust_target}-clang"
 [[ -x "$compiler" ]] || { echo "missing $compiler" >&2; exit 1; }
 
@@ -37,22 +37,22 @@ env "CC_${underscored}=$compiler" \
     "$cargo_linker=$compiler" \
     CARGO_TARGET_DIR="$root/rust/target" \
     cargo build --manifest-path "$root/rust/Cargo.toml" \
-      -p yanshu-core --target "$rust_target" --release
+      -p yanou-core --target "$rust_target" --release
 
-cp "$root/rust/target/$rust_target/release/libyanshu_core.so" "$out/"
+cp "$root/rust/target/$rust_target/release/libyanou_core.so" "$out/"
 
 # C only: no libc++_shared.so to package, unlike a C++ NAPI shim.
 "$compiler" -shared -fPIC -O2 -Wall -Wextra -Werror \
-  -Wl,--no-undefined -Wl,-soname,libyanshu.so \
-  "$root/entry/src/main/cpp/yanshu_napi.c" \
+  -Wl,--no-undefined -Wl,-soname,libyanou.so \
+  "$root/entry/src/main/cpp/yanou_napi.c" \
   -I"$ndk/sysroot/usr/include" \
-  -L"$out" -lyanshu_core -lace_napi.z \
-  -o "$out/libyanshu.so"
+  -L"$out" -lyanou_core -lace_napi.z \
+  -o "$out/libyanou.so"
 
-"$ndk/llvm/bin/llvm-readobj" --file-headers "$out/libyanshu.so" | grep "EM_AARCH64" >/dev/null
+"$ndk/llvm/bin/llvm-readobj" --file-headers "$out/libyanou.so" | grep "EM_AARCH64" >/dev/null
 # The registration constructor is a local symbol, so this is the full symbol table, not -D.
-"$ndk/llvm/bin/llvm-nm" --defined-only "$out/libyanshu.so" | grep "RegisterYanshuModule" >/dev/null
-"$ndk/llvm/bin/llvm-readobj" --needed-libs "$out/libyanshu.so" | grep "libyanshu_core.so" >/dev/null
+"$ndk/llvm/bin/llvm-nm" --defined-only "$out/libyanou.so" | grep "RegisterYanouModule" >/dev/null
+"$ndk/llvm/bin/llvm-readobj" --needed-libs "$out/libyanou.so" | grep "libyanou_core.so" >/dev/null
 
 echo "native libraries:"
 ls -la "$out"

@@ -14,7 +14,7 @@ OUT_DIR="${ROOT}/../tmp"
 NAME="${1:-shot}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOCAL="${OUT_DIR}/${NAME}-${STAMP}.jpeg"
-REMOTE="/data/local/tmp/yanshu-shot.jpeg"
+REMOTE="/data/local/tmp/yanou-shot.jpeg"
 
 HDC="${HDC:-/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/toolchains/hdc}"
 if [ ! -x "${HDC}" ]; then

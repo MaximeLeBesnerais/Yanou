@@ -1,16 +1,21 @@
-# Yanshu
+# 燕鸥 (Yàn'ōu)
 
-Yanshu is an unofficial client for Mullvad VPN on HarmonyOS NEXT. It signs in with a
-Mullvad account number, registers a WireGuard device with `api.mullvad.net`, downloads
-Mullvad's signed relay list, and routes device traffic through a selected relay using the
-system VPN extension.
+燕鸥 is a **WireGuard client** for HarmonyOS NEXT that connects to Mullvad VPN. It is a
+client and nothing else: it runs no servers, sells no subscription and has no account of
+its own. You sign in with a Mullvad account you already hold; the app registers a WireGuard
+device with `api.mullvad.net`, downloads Mullvad's signed relay list, and routes device
+traffic through a selected relay using the system VPN extension. The relays, the account
+and its five-device limit all belong to Mullvad.
 
-It is not a proxy and not a separate VPN service. The relays belong to Mullvad, the account
-and its five-device limit belong to Mullvad, and the traffic is carried by WireGuard.
+Mullvad does not provide an official client for HarmonyOS, which is why this app exists. It
+is an unofficial **student project, not a company**, and it is not affiliated with,
+endorsed by or supported by Mullvad VPN AB. "Mullvad" is used only to describe the service
+this client connects to.
 
-Yanshu is not affiliated with, endorsed by or supported by Mullvad VPN AB. "Mullvad" is
-used only to describe the service this client connects to. Use it with your own account and
-at your own risk.
+**If anyone sold you a subscription, an account or "Mullvad access" through this app or
+through any third party, you were scammed.** This app never sells anything. Mullvad accounts
+are sold only by Mullvad, at <https://mullvad.net>. There are no terms of service here,
+because there is no service: use it with your own account and at your own risk.
 
 The client handles two kinds of filtered network. When `api.mullvad.net` is DNS-poisoned,
 the API is reached through Mullvad's domain-fronting protocol rather than a direct HTTPS
@@ -75,7 +80,7 @@ CARGO_HOME="$HOME/.cargo" ./scripts/build-native.sh
 ```
 
 The first native build compiles `aws-lc-sys` and takes several minutes. The script takes the
-NDK path from `YANSHU_OHOS_NDK` or the default DevEco location, and uses the bundled cmake.
+NDK path from `YANOU_OHOS_NDK` or the default DevEco location, and uses the bundled cmake.
 
 HAP:
 
@@ -121,7 +126,7 @@ hdc shell aa start -b com.maxime.muharmony -a EntryAbility
 
 The bundle identifier is `com.maxime.muharmony`. It is fixed by the signing profile and by
 the data of existing installations. The user-visible name comes from the label
-`$string:app_name`, which is `Yanshu`.
+`$string:app_name`, which is `燕鸥`.
 
 ### Distribution
 
@@ -151,13 +156,13 @@ ability in a separate process, and the UI talks to it through the system VPN ser
 EntryAbility (UI process, ArkTS)
    |  startVpnExtensionAbility(Want{ ipv6, ipVersion, killSwitch, target, relayCandidates, ... })
    v
-YanshuVpnAbility (separate process, ArkTS and Rust)
+YanouVpnAbility (separate process, ArkTS and Rust)
    |  vpnExtension.createVpnConnection(context).create(VpnConfig)
    |     -> tun fd, routes, DNS, MTU
    |  connection.protect(udpFd)
    |  native.tunnelStart(fd, ..., endpoint, ssEndpoint)
    v
-libyanshu_core.so (Rust: tun, gotatun, transports, API client)
+libyanou_core.so (Rust: tun, gotatun, transports, API client)
    |  UDP datagrams to the relay
    v
 relay (WireGuard server)
@@ -192,7 +197,7 @@ extension needs is either passed in the `Want` or read from the app sandbox.
 
 ### Native API
 
-`app/rust/crates/core` is a `cdylib` with a C ABI. `app/entry/src/main/cpp/yanshu_napi.c`
+`app/rust/crates/core` is a `cdylib` with a C ABI. `app/entry/src/main/cpp/yanou_napi.c`
 wraps it for ArkTS, which keeps the module free of `libc++_shared.so`.
 
 | Function | Purpose |
@@ -298,9 +303,9 @@ cache is reused for 24 hours, and a missing field forces a refresh.
 ```
 app/                         DevEco project
   entry/src/main/ets/        ArkTS: UI, VPN extension, settings, diagnostics
-  entry/src/main/cpp/        C NAPI shim (yanshu_napi.c) and typings
+  entry/src/main/cpp/        C NAPI shim (yanou_napi.c) and typings
   entry/libs/arm64-v8a/      built native libraries (ignored by git)
-  rust/crates/core/          Rust: tunnel, transports, API client (crate yanshu-core)
+  rust/crates/core/          Rust: tunnel, transports, API client (crate yanou-core)
   scripts/                   build-native, screenshot, push-HAP
 PORT-PLAN.md                 feasibility study, milestones, roadmap, UI backlog
 ANDROID-PATH-REPORT.md       the official client's connect path, step by step
@@ -308,7 +313,7 @@ ANDROID-PATH-REPORT.md       the official client's connect path, step by step
 
 The port follows the upstream client's split between tunnel, obfuscation and API:
 
-| Android client | Yanshu |
+| Android client | 燕鸥 |
 |---|---|
 | `talpid-wireguard` | `app/rust/crates/core/src/tunnel.rs` |
 | `tunnel-obfuscation::shadowsocks` | `app/rust/crates/core/src/obfs.rs` |
@@ -327,6 +332,5 @@ from `mullvad/mullvadvpn-app` and remain under their authors' copyright.
 
 ## Name
 
-"Yanshu" is 鼹鼠 (yǎnshǔ), Mandarin for "mole", which is also what "mullvad" means in
-Swedish. The name echoes the service this client connects to and does not imply any
-affiliation.
+"燕鸥" (yàn'ōu) is the Chinese name for the tern, a seabird. The app is named after the
+bird; the name does not reference any VPN brand.

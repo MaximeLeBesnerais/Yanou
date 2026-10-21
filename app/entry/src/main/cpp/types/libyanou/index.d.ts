@@ -1,5 +1,5 @@
 /**
- * Type surface of entry/src/main/cpp/yanshu_napi.c.
+ * Type surface of entry/src/main/cpp/yanou_napi.c.
  *
  * Numbers in, numbers out: the native core owns the tun fd and reports counters as
  * JSON so the ArkTS side never parses a binary layout. A negative return value is an

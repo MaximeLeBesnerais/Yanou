@@ -1,9 +1,9 @@
 /*
- * NAPI surface of the Yanshu native core.
+ * NAPI surface of the Yanou native core.
  *
  * Kept in C and free of the C++ runtime so the module has no libc++_shared.so
  * dependency to ship. Every call forwards to a C ABI exported by the Rust
- * cdylib (yanshu-core); this file only translates JS values.
+ * cdylib (yanou-core); this file only translates JS values.
  */
 
 #include <stdint.h>
@@ -187,7 +187,7 @@ static napi_value StartApiJob(napi_env env, napi_callback_info info, int kind, i
     napi_value promise;
     napi_create_promise(env, &job->deferred, &promise);
     napi_value name;
-    napi_create_string_utf8(env, "yanshuApi", NAPI_AUTO_LENGTH, &name);
+    napi_create_string_utf8(env, "yanouApi", NAPI_AUTO_LENGTH, &name);
     napi_create_async_work(env, NULL, name, ExecuteApi, CompleteApi, job, &job->work);
     napi_queue_async_work(env, job->work);
     return promise;
@@ -467,17 +467,17 @@ static napi_value Init(napi_env env, napi_value exports)
 }
 EXTERN_C_END
 
-static napi_module yanshuModule = {
+static napi_module yanouModule = {
     .nm_version = 1,
     .nm_flags = 0,
     .nm_filename = NULL,
     .nm_register_func = Init,
-    .nm_modname = "yanshu",
+    .nm_modname = "yanou",
     .nm_priv = NULL,
     .reserved = { 0 },
 };
 
-__attribute__((constructor)) static void RegisterYanshuModule(void)
+__attribute__((constructor)) static void RegisterYanouModule(void)
 {
-    napi_module_register(&yanshuModule);
+    napi_module_register(&yanouModule);
 }
