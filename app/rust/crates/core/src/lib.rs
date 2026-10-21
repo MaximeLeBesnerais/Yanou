@@ -9,6 +9,12 @@
 //! The C ABI is deliberately small and allocation-free at the boundary: strings in,
 //! numbers out, JSON written into a caller-supplied buffer.
 
+// The exported C ABI takes raw pointers from the NAPI shim. Marking these functions
+// `unsafe` would not change the C side and would force every Rust caller, tests included,
+// into an unsafe block, so the contract is stated here instead: each pointer is either
+// null (handled by the callee) or a NUL-terminated string that outlives the call.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::ffi::CStr;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
