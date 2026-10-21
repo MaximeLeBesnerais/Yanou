@@ -9,12 +9,12 @@
 | Dirs added for this analysis | `mullvad-relay-selector`, `mullvad-daemon-relay-selector`, `mullvad-management-interface`, `talpid-net`, `talpid-tunnel-config-client`, `mullvad-cli`, `docs` |
 | Platform traced | `target_os = "android"` (all Android-specific `cfg` branches quoted as such) |
 | gotatun | crates.io dependency, `Cargo.toml:82` → `0.10.0` (lockfile `Cargo.lock:2045-2046`); source inspected from `~/.cargo/registry/src/index.crates.io-*/gotatun-0.10.1/` |
-| Your app code | **not** read or modified. Only the description in the task was used. |
+| Client code | not read or modified; the description in the task was used. |
 
 **Path convention:** every `path:line` reference is relative to the repository root
 `./source`. Line numbers are from the commit above.
 
-Everything below is from the upstream source unless explicitly marked **(inference)** or **(your report)**.
+Everything below is from the upstream source unless explicitly marked **(inference)** or **(from the task description)**.
 
 ---
 
@@ -26,7 +26,7 @@ Everything below is from the upstream source unless explicitly marked **(inferen
 4. The only transports that can reach a *different IP* than `ipv4_addr_in` are **Shadowsocks** (`endpoint_data.shadowsocks_extra_addr_in`) and **QUIC/MASQUE** (`features.quic.addr_in`). Plain WG, LWO and udp2tcp all reuse the WG address. The Singapore relays publish **neither** extra address, so on that relay the official client has exactly one IPv4 address and one IPv6 address to choose from. Bridges are **API-only** and can never carry tunnel traffic.
 5. Therefore: on a network where the chosen relay's IPv4 is blackholed at L3 and the device has no IPv6, **the official client cannot connect either**. It would keep cycling through direct → LWO → Shadowsocks → QUIC → udp2tcp (all on blocked IPv4 addresses), never becoming `Connected`. Details and the exact escape hatches in §6.
 
-Two *additional* independent bugs in your description were found (they do not explain the missing handshake reply, but they would prevent traffic right after it): the tunnel address `10.64.0.1/32` is the **gateway**, not the device's assigned address, and your Shadowsocks probe used port 1236 instead of the list's `shadowsocks_port_ranges`.
+Two *additional* independent bugs in the original description were found (they do not explain the missing handshake reply, but they would prevent traffic right after it): the tunnel address `10.64.0.1/32` is the **gateway**, not the device's assigned address, and the Shadowsocks probe from the task used port 1236 instead of the list's `shadowsocks_port_ranges`.
 
 ---
 
@@ -308,7 +308,7 @@ let request = self.handle.post_json(&format!("{ACCOUNTS_URL_PREFIX}/devices"), &
 
 `PrivateDevice::try_from_device` even asserts the invariant (`mullvad-daemon/src/device/mod.rs:197-205`): `if device.pubkey != wg_data.private_key.public_key() { … }`.
 
-> **Relevant to you:** the account/device public key does not need to reach the relay by any other route. It is registered once via `POST /accounts/v1/devices`, and the relay learns it from that same API. Your registration is confirmed present, so this step is *not* the problem.
+> **Relevant to the client:** the account/device public key does not need to reach the relay by any other route. It is registered once via `POST /accounts/v1/devices`, and the relay learns it from that same API. The registration is confirmed present, so this step is *not* the problem.
 
 ### 1.7 Pre-tunnel work: ephemeral peers (PQ) / DAITA, obfuscation
 
@@ -781,7 +781,7 @@ Backoff: there is no sleep between attempts; the delay is the failed attempt its
 | 1 | Connect trigger | Compose `ConnectionButton` → `ConnectViewModel.onConnectClick` (`ConnectionButton.kt:76-83`, `ConnectViewModel.kt:174`) | ArkTS UI → `startVpnExtensionAbility` | Equivalent |
 | 2 | Transport to daemon | gRPC `ConnectTunnel` on a Unix socket (`ManagementService.kt:342`, `management_interface.proto:12`) | in-process Rust cdylib via C NAPI | Equivalent |
 | 3 | Target state | `DaemonCommand::SetTargetState(Secured)` (`management_interface.rs:79-86`) → `TunnelCommand::Connect` (`lib.rs:3552-3570`) | direct call | Equivalent |
-| 4 | State machine | `ConnectingState::enter(retry_attempt=0)`; unbounded retries | one shot + 5 s `force_handshake` timeout, then you poll | You give up much earlier; official retries for minutes across 7 transports |
+| 4 | State machine | `ConnectingState::enter(retry_attempt=0)`; unbounded retries | one shot + 5 s `force_handshake` timeout, then the client polls | The client gives up much earlier; official retries for minutes across 7 transports |
 | 5 | Relay list | verified Sigsum list from `api.mullvad.net/app/v1/relays` (`mullvad-api/src/relay_list.rs:74-89`) | same list, fetched via CDN77 fronting — **the list content is identical, so this is not a difference** | none |
 | 6 | Relay + address | weighted random relay; random port in `wireguard.port_ranges`; address = `ipv4_addr_in` (v4) or `ipv6_addr_in` (v6) (`endpoint_set.rs:126-134, 365-382`) | relay `ipv4_addr_in`, port 51820 (and a few others) | Same address family. You never try IPv6 because the tablet has none — same as the official client there. |
 | 7 | Pre-tunnel PQ/PSK | **ON by default**: full WG handshake + TCP to `10.64.0.1:1337` before the tunnel opens (`ephemeral.rs:28-84`) | not implemented | Neither can succeed when the relay is unreachable; PQ makes the official client fail *earlier* (8 s timeout) |
@@ -793,12 +793,12 @@ Backoff: there is no sleep between attempts; the delay is the failed attempt its
 | 13 | routes into tun | `0/0` (+`::/0` iff IPv6 gateway) (`gotatun/mod.rs:559-568`) | `0.0.0.0/0`, `::/0` | Equivalent (harmless even without IPv6) |
 | 14 | DNS | gateways `10.64.0.1` + `fc00:bbbb:bbbb:bb01::1`, IPv6 DNS dropped if no v6 (`tun_provider/android/mod.rs:312-323`) | `10.64.0.1` | Equivalent (v4) |
 | 15 | MTU | computed from route MTU (`lib.rs:459-467`), typically 1380–1420 | 1420 | Cosmetic; not a handshake factor |
-| 16 | socket exclusion | `SocketBypass` applied to the fd gotatun just created, inside the factory (`gotatun/obfuscation/mod.rs:130-143` → JNI `bypass`) | `vpnConnection.protect(fd)` on a pre-created fd, then wrap it | Equivalent **iff** `protect` returned true for the exact fd being used; your `blockedApplications` would also exclude your UID entirely (verify which of the two is actually in effect) |
-| 17 | self-exclusion | `addDisallowedApplication(app)` for split-tunnel apps only (`TalpidVpnService.kt:119`) — the official app does *not* exclude itself; it uses `protect()` | `blockedApplications: [own bundle]` | Different mechanism, same intent. If HarmonyOS's `blockedApplications` does not exclude raw sockets created by native code, your packets go *into* the tun — see H3 |
+| 16 | socket exclusion | `SocketBypass` applied to the fd gotatun just created, inside the factory (`gotatun/obfuscation/mod.rs:130-143` → JNI `bypass`) | `vpnConnection.protect(fd)` on a pre-created fd, then wrap it | Equivalent **iff** `protect` returned true for the exact fd being used; the client's `blockedApplications` would also exclude its UID entirely (verify which of the two is actually in effect) |
+| 17 | self-exclusion | `addDisallowedApplication(app)` for split-tunnel apps only (`TalpidVpnService.kt:119`) — the official app does *not* exclude itself; it uses `protect()` | `blockedApplications: [own bundle]` | Different mechanism, same intent. If HarmonyOS's `blockedApplications` does not exclude raw sockets created by native code, the client's packets go *into* the tun — see H3 |
 | 18 | firewall / kill switch | no-op stub on Android (`firewall/android.rs`) | none | none |
 | 19 | "tunnel up" criterion | `rx_bytes > 0` for every peer (`check.rs:390`) + ICMP/TCP probe to `10.64.0.1` (`check.rs:145-168`) | `peers()` `last_handshake` polled every 500 ms | The official client literally cannot report Connected without a reply; yours correctly reports failure. Same criterion, same outcome. |
 | 20 | retry on unreachable relay | unbounded, new relay + new port every attempt, cycling the 7 transports | none | This is the biggest *behavioural* gap, and it still would not help on a fully blocked relay set |
-| 21 | relay IP override | `RelayOverride { ipv4_addr_in, ipv6_addr_in }` per hostname (`relay_constraints.rs:823-877`, applied at `mullvad-daemon/src/lib.rs:762`) — and it *strips* `shadowsocks_extra_addr_in` of the overridden family | none | An escape hatch you don't have, but it needs a reachable IP to point at |
+| 21 | relay IP override | `RelayOverride { ipv4_addr_in, ipv6_addr_in }` per hostname (`relay_constraints.rs:823-877`, applied at `mullvad-daemon/src/lib.rs:762`) — and it *strips* `shadowsocks_extra_addr_in` of the overridden family | none | An escape hatch the client does not have, but it needs a reachable IP to point at |
 | 22 | custom relay | `RelaySettings::CustomTunnelEndpoint` bypasses the selector entirely (`tunnel.rs:207-220`) | none | Same |
 
 ---
@@ -970,9 +970,9 @@ Per relay:
 | `us-nyc-wg-701` | 23.162.8.3 | 2602:fa1f:1::f001 | 23.162.8.9 | none |
 | `al-tia-wg-001` | 103.124.165.2 | 2a04:27c0:0:e::f001 | 103.124.165.17-27 + `::b002..b01f` | 103.124.165.6-16 + `::c002..c01f` |
 
-Observations that matter for you:
+Observations that matter for the client:
 
-* The IPv6 address your Mac reached (`[2a02:6ea0:d13e:2::a10f]:26899`) is **exactly `sg-sin-wg-002.ipv6_addr_in`**, and 26899 lies in `4000-33433` — i.e. that session was IPv6, on a random port, on that relay. This is consistent with the client having failed attempt #1 (IPv4) and succeeded on attempt #2 (IPv6) — **(inference)** that corroborates an IPv4 blackhole even from your LAN.
+* The IPv6 address the Mac reached (`[2a02:6ea0:d13e:2::a10f]:26899`) is **exactly `sg-sin-wg-002.ipv6_addr_in`**, and 26899 lies in `4000-33433` — i.e. that session was IPv6, on a random port, on that relay. This is consistent with the client having failed attempt #1 (IPv4) and succeeded on attempt #2 (IPv6) — **(inference)** that corroborates an IPv4 blackhole even from the local network.
 * **For the SG relays there is no alternative IPv4 address at all.** Shadowsocks on `sg-sin-*` can only use `ipv4_addr_in` on ports 51900-51949. QUIC is unavailable. So no client-side transport choice can reach an SG relay other than through `ipv4_addr_in` or `ipv6_addr_in`.
 * The alternative addresses that do exist (SS "extra", QUIC) are almost always in the **same /24** as `ipv4_addr_in` (e.g. `23.234.100.3` vs `.13`/`.14`), i.e. they are separate daemons on the same host/rack. A prefix-level or ASN-level block catches them too.
 * Ports: `51820` is in range. Your Mac's `26899` is in range. Port 1236 and 53/123 UDP probes to the relay are also in range (53 and 123 are deliberately in `port_ranges`). But **1236 is not a Shadowsocks port** — SS is only on `shadowsocks_port_ranges` (51900-51949) unless the relay has `shadowsocks_extra_addr_in` (SG does not).
@@ -995,7 +995,7 @@ In this checkout the enum is effectively vestigial: `RelayEndpointData::Bridge` 
 * `mullvad-relay-selector/src/relay_selector/mod.rs:123-129, 246-261` — `get_bridge_forced()` picks a random active bridge and its Shadowsocks endpoint (`ipv4_addr_in` + a random `bridge.shadowsocks[].port`).
 * The proto says it outright: `management_interface.proto:104` — `// Bridges (Used for reaching the API)`.
 
-**There is no code path in this version that sends tunnel traffic over a bridge.** So the fact that bridge IPs answer your ICMP proves only that the bridge prefix is not blocked, not that any tunnel path exists.
+**There is no code path in this version that sends tunnel traffic over a bridge.** So the fact that bridge IPs answer the client's ICMP proves only that the bridge prefix is not blocked, not that any tunnel path exists.
 
 ### 3.5 Custom relay / IP override
 
@@ -1016,7 +1016,7 @@ In this checkout the enum is effectively vestigial: `RelayEndpointData::Bridge` 
   });
   ```
 
-  This is the officially supported "the relay's IP is blocked, point the hostname at another IP" escape hatch. Note it deliberately drops the SS extra addresses of the overridden family (you are overriding precisely because they are blocked), but it does **not** touch `quic.addr_in`.
+  This is the officially supported "the relay's IP is blocked, point the hostname at another IP" escape hatch. Note it deliberately drops the SS extra addresses of the overridden family (the override exists precisely because they are blocked), but it does **not** touch `quic.addr_in`.
 * `RelaySettings::CustomTunnelEndpoint` (`mullvad-daemon/src/tunnel.rs:206-220`) bypasses relay selection entirely and builds parameters from a user-supplied hostname/port/key (`mullvad-types/src/custom_tunnel.rs`). Manual only.
 * The endpoint the daemon reports to the UI/firewall is recomputed from the *obfuscator* when one is used (`talpid-types/src/net/wireguard.rs:27-49`, `Obfuscators::endpoints()` at `talpid-types/src/net/obfuscation.rs:80-103`) — i.e. the "next hop" is the SS/QUIC/udp2tcp address, not the WG address. That is the mechanical proof that, for those modes, the client's real destination is *not* `ipv4_addr_in`.
 * `mullvad-daemon/src/tunnel.rs:192-205` also records whether the selected endpoint came from an override (`server_override`, computed by comparing the endpoint family against `overridden_ipv4/ipv6`).
@@ -1049,31 +1049,31 @@ In this checkout the enum is effectively vestigial: `RelayEndpointData::Bridge` 
 ### H3 — Your UDP socket is not actually excluded from the tunnel, so the handshake is written into the tun and never leaves the device.
 
 **For:**
-* In the official client the socket that is protected is the one gotatun created, and the bypass happens inside the factory (`gotatun/obfuscation/mod.rs:130-143`); a pre-created fd that is later wrapped (your design) only works if `protect()` succeeded on that exact fd, and if the wrapper does not `dup()` it.
+* In the official client the socket that is protected is the one gotatun created, and the bypass happens inside the factory (`gotatun/obfuscation/mod.rs:130-143`); a pre-created fd that is later wrapped (the current design) only works if `protect()` succeeded on that exact fd, and if the wrapper does not `dup()` it.
 * A handshake written into the tun would look exactly like "sent, no reply": gotatun's `tx_bytes` would increase.
 
 **Against (strong):**
-* Your `blockedApplications: [own bundle]` should exclude *all* sockets of your UID from the VPN, making `protect()` redundant. If HarmonyOS implements that as Android's `addDisallowedApplication`, H3 is impossible.
+* The `blockedApplications: [own bundle]` setting should exclude *all* sockets of the app's UID, making `protect()` redundant. If HarmonyOS implements that as Android's `addDisallowedApplication`, H3 is impossible.
 * You also report ICMP/TCP failures to the relay *from the device*, which is independent of the WG socket.
 * Ports 53/123 attempts also failed; a routing loop would fail the same way, so this is not fully excluded — just unlikely.
 
-**Discriminator:** capture on the uplink (or `tcpdump` on a laptop sharing the connection) while your client sends; or temporarily set `blockedApplications: []` and rely on `protect()` alone and compare.
+**Discriminator:** capture on the uplink (or `tcpdump` on a laptop sharing the connection) while the client sends; or temporarily set `blockedApplications: []` and rely on `protect()` alone and compare.
 
-### H4 — Wrong relay public key for the IP you dial (stale/mixed relay entries) → MAC1 mismatch → silent drop.
+### H4 — Wrong relay public key for the IP dialled (stale/mixed relay entries) → MAC1 mismatch → silent drop.
 
 **For:** WireGuard silently discards handshakes whose MAC1 does not verify against the receiver's static public key. A stale relay list, or mixing `ipv4_addr_in` from relay A with `public_key` from relay B, produces exactly "no reply, ever", even on an open network.
 
-**Against:** you fetched the signed list, and the Mac works with the same list (over IPv6, but with the same key material). Verify that the `public_key` you use belongs to the same hostname as the IP.
+**Against:** the client fetched the signed list, and the Mac works with the same list (over IPv6, but with the same key material). Verify that the `public_key` in use belongs to the same hostname as the IP.
 
-**Discriminator:** dial a relay whose key you re-derive from a fresh list fetch; or run a local `wg` responder and confirm gotatun completes a handshake against it (this also tests your socket/bypass path).
+**Discriminator:** dial a relay whose key is re-derived from a fresh list fetch; or run a local `wg` responder and confirm gotatun completes a handshake against it (this also tests the socket and bypass path).
 
 ### H5 — Missing PSK / PQ negotiation is the cause. **Ruled out.**
 
 A responder does not need a PSK to answer an initiation; the PSK only enters the chaining key, so a mismatch yields an answer that fails to verify, not silence. And the official client's PSK is obtained *through* the relay (`ephemeral.rs`), so it cannot be a precondition for reaching it. Similarly, DAITA is off by default (`mullvad-types/src/wireguard.rs:207-214`).
 
-### H6 — The relay drops your handshake because of the inner source address. **Ruled out for the handshake.**
+### H6 — The relay drops the handshake because of the inner source address. **Ruled out for the handshake.**
 
-Your tun address is the gateway (`10.64.0.1/32`) instead of the device's assigned /32 (`tunnel.rs:224-231`, `mullvad-api/src/device.rs:22-31`). Mullvad programmes the peer's allowed-ips with the address it assigned to your device **(inference — server-side config is not in this repo)**, so inner packets sourced from `10.64.0.1` will be dropped — but **after** a handshake, and the handshake itself carries no inner address. This is a real, independent bug (it would also break the config-service probe, and on Android `10.64.0.1/32` is a local address so a probe to it never enters the tunnel at all).
+The tun address is the gateway (`10.64.0.1/32`) instead of the device's assigned /32 (`tunnel.rs:224-231`, `mullvad-api/src/device.rs:22-31`). Mullvad programmes the peer's allowed-ips with the address it assigned to the device **(inference — server-side config is not in this repo)**, so inner packets sourced from `10.64.0.1` will be dropped — but **after** a handshake, and the handshake itself carries no inner address. This is a real, independent bug (it would also break the config-service probe, and on Android `10.64.0.1/32` is a local address so a probe to it never enters the tunnel at all).
 
 ### H7 — Wrong transport framing for SS/QUIC. **Not applicable to the WG probe.**
 
@@ -1081,7 +1081,7 @@ Even with the right port, an SS implementation that omits the `[salt][address][p
 
 ### H8 — UDP is blocked wholesale on the mobile network. **Ruled out (mostly).**
 
-DNS to `1.1.1.1:53` produced replies (spoofed/injected, but they arrived), and your ICMP/UDP probes to bridges work. So UDP is not blanket-dropped; the drop is destination-specific.
+DNS to `1.1.1.1:53` produced replies (spoofed/injected, but they arrived), and the ICMP/UDP probes to bridges work. So UDP is not blanket-dropped; the drop is destination-specific.
 
 ---
 
@@ -1093,7 +1093,7 @@ Concretely, on the Mac that currently works over IPv6:
 
 ```
 mullvad relay set ip-version v4      # wireguard_constraints.ip_version = Only(V4)
-mullvad relay set location sg        # same relay set your client used
+mullvad relay set location sg        # same relay set the client used
 mullvad anti-censorship set mode auto
 mullvad connect && mullvad status -v
 ```
@@ -1110,12 +1110,12 @@ IPv6 on attempt #2. Only `relay set ip-version v4` does that.
 
 Why this is the right experiment:
 
-* It uses the official, known-good WireGuard stack, so it isolates **network** from **your client**.
-* `RETRY_ORDER` means the Mac will *also* try IPv6 on attempt #2 unless you pin IPv4 — pinning is what makes the test conclusive.
+* It uses the official, known-good WireGuard stack, so it isolates **network** from **the client**.
+* `RETRY_ORDER` means the Mac will *also* try IPv6 on attempt #2 unless IPv4 is pinned, which is what makes the test conclusive.
 * If the Mac cannot connect over IPv4 either, H1 is confirmed and no amount of client-side work (obfuscation, PQ, keepalive, tun address) will produce a handshake.
-* If the Mac *can* connect over IPv4 (direct or Shadowsocks), then compare the exact `(ip, port, transport)` it used against yours with `tcpdump -ni any udp and host <relay_ip>`; that difference is your bug.
+* If the Mac *can* connect over IPv4 (direct or Shadowsocks), then compare the exact `(ip, port, transport)` it used against the client's with `tcpdump -ni any udp and host <relay_ip>`; that difference is the bug.
 
-Secondary, if the Mac is not available: replay the exact 148-byte initiation your client emits from a host on the same LAN (you already have the bytes) and watch for any reply; silence there is conclusive for H1. And capture on the uplink while your client runs, to close out H3.
+Secondary, if the Mac is not available: replay the exact 148-byte initiation the client emits from a host on the same LAN (the bytes have already been captured) and watch for any reply; silence there is conclusive for H1. And capture on the uplink while the client runs, to close out H3.
 
 ---
 
@@ -1132,13 +1132,13 @@ Reasoning, strictly from the code:
 
 **The only ways it could connect**, in order of plausibility:
 
-1. **IPv6**: if the device had a global IPv6 address, ladder entry #2 would dial `ipv6_addr_in` on a random port — exactly what your Mac did (`[2a02:6ea0:d13e:2::a10f]:26899`).
+1. **IPv6**: if the device had a global IPv6 address, ladder entry #2 would dial `ipv6_addr_in` on a random port — exactly what the Mac did (`[2a02:6ea0:d13e:2::a10f]:26899`).
 2. **A relay that publishes a Shadowsocks dedicated address outside the blocked prefix** (`shadowsocks_extra_addr_in`, ladder entry #4). Exists for e.g. `us-nyc-wg-701..703`, `us-nyc-wg-801..808`, `al-tia-wg-001` — but these alternate addresses are in the same /24 as the blocked WG address, so a prefix-level block defeats them. **None of the SG relays have one.**
 3. **A relay with a QUIC/MASQUE endpoint outside the blocked prefix** (ladder entry #5, UDP/443 + TLS to `<relay>.blockerad.eu`). Same /24 caveat; SG has none.
-4. **A user-configured `RelayOverride`** pointing a hostname at an unblocked IP (needs an unblocked IP, which is the thing you don't have).
+4. **A user-configured `RelayOverride`** pointing a hostname at an unblocked IP (needs an unblocked IP, which is the missing piece).
 5. **A bridge**: not possible in this version — bridges are only an API access method (§3.4).
 
-So: on the tested network the official client is in the same position as yours, with two extra shots (SS/QUIC alternate IPs, both absent on SG) and one unavailable shot (IPv6). **The missing handshake is not, on the evidence available, a difference between your client and the official one — the destination itself is unreachable.** The differences that *are* real (wrong inner tunnel address, no transport ladder, invalid SS port in your experiment) should be fixed, but they are downstream of reachability.
+So: on the tested network the official client is in the same position as the client, with two extra shots (SS/QUIC alternate IPs, both absent on SG) and one unavailable shot (IPv6). **The missing handshake is not, on the evidence available, a difference between the client and the official one — the destination itself is unreachable.** The differences that *are* real (wrong inner tunnel address, no transport ladder, invalid SS port in the experiment) should be fixed, but they are downstream of reachability.
 
 ---
 

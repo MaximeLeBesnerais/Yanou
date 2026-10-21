@@ -1,4 +1,4 @@
-# Mullvad client on HarmonyOS — feasibility and port plan
+# Mullvad on HarmonyOS: feasibility and port plan
 
 Checked against the actual sources: `mullvadvpn-app@main` (sparse clone in `source/`) and the
 HarmonyOS SDK installed here (`DevEco-Studio.app/Contents/sdk/default`, API 26 / HarmonyOS 26.0.0).
@@ -8,22 +8,22 @@ HarmonyOS SDK installed here (`DevEco-Studio.app/Contents/sdk/default`, API 26 /
 
 ## Verdict
 
-It is possible, and the protocol half is smaller than you'd expect because the ecosystem already
-moved: the `tun` crate has an OpenHarmony backend that takes a raw fd, `libc`/`nix` know about
-`target_env = "ohos"`, and `aws-lc-sys` ships an explicit OpenHarmony build path
+The port is feasible, and the protocol layer is smaller than it appears because the ecosystem
+already moved: the `tun` crate has an OpenHarmony backend that takes a raw fd, `libc`/`nix` know
+about `target_env = "ohos"`, and `aws-lc-sys` ships an explicit OpenHarmony build path
 (`OHOS_NDK_HOME` → NDK's `ohos.toolchain.cmake`). Mullvad's WireGuard is `gotatun`, which is
 pure Rust apart from the AEAD provider, so it cross-compiles once cmake is on PATH.
 
-What is *not* small is everything around it: 89k lines of Kotlin/Compose that cannot exist on
-HarmonyOS, a Rust core whose Android branches are the ones you need and whose Linux branches are
-the ones that compile, and a platform model that tears the VPN down when your UI process dies.
+What is not small is everything around it: 89k lines of Kotlin/Compose that cannot exist on
+HarmonyOS, a Rust core whose Android branches are the ones that matter and whose Linux branches
+are the ones that compile, and a platform model that tears the VPN down when the UI process dies.
 
-So: **not "a big VPN bullshit"** — the VPN part is the well-supported part. The bullshit is
-platform lifecycle and the fact that you are writing a new client, not porting one.
+The VPN layer is the well-supported part. The work is in the platform lifecycle, and in writing a
+new client rather than porting one.
 
 ## 1. The partial clone
 
-Yes, and the clone itself is small. Measured on this machine:
+The clone is small. Measured on this machine:
 
 ```
 git clone --depth 1 --filter=blob:none --sparse https://github.com/mullvad/mullvadvpn-app.git
@@ -31,7 +31,7 @@ cd mullvadvpn-app && git sparse-checkout set android
 # .git 23M, android/ 33M
 ```
 
-Add the crates you actually need to read:
+Add the crates needed for the analysis:
 
 ```
 git sparse-checkout add talpid-core talpid-tunnel talpid-wireguard talpid-routing \
@@ -39,17 +39,18 @@ git sparse-checkout add talpid-core talpid-tunnel talpid-wireguard talpid-routin
 # whole thing: 26M .git, 67M working tree
 ```
 
-`android/` alone is not a buildable unit, and it is not the part you port:
+`android/` alone is not a buildable unit, and it is not the part being ported:
 
 - `android/settings.gradle.kts` pulls in 91 Gradle modules, most of them under `android/lib/*`.
-- `android/app/build.gradle.kts:346` sets `module = repoRootPath`, `libname = "mullvad-jni"` —
+- `android/app/build.gradle.kts:346` sets `module = repoRootPath`, `libname = "mullvad-jni"`;
   the tunnel comes from the Rust workspace at the repo root, not from `android/`.
 - `:165` and `:222` pull `dist-assets/relays/` in as app assets.
 
-If you want to *build* the Android app you need the whole repo, the Android SDK/NDK, JDK 17 and
-the Rust Android targets — ~10 GB, and it buys you nothing for HarmonyOS. Clone it to read.
+Building the Android app requires the whole repository, the Android SDK/NDK, JDK 17 and the
+Rust Android targets, about 10 GB, none of which helps with HarmonyOS. A read-only clone is enough
+for the analysis.
 
-## 2. What HarmonyOS already gives you
+## 2. What HarmonyOS provides
 
 `@ohos.net.vpnExtension` (API 11+, present in this SDK at
 `openharmony/ets/api/@ohos.net.vpnExtension.d.ts`) is the `VpnService` equivalent, and the
@@ -69,9 +70,9 @@ mapping is almost one-to-one:
 | `VpnService` lifecycle                  | `VpnExtensionAbility` (`"type": "vpn"`)         |
 
 What this buys: `protect()` is the one thing that cannot be emulated, and it exists. The tun fd is
-a real fd you can hand to Rust. Routes, DNS, MTU and per-app split tunnelling are all system-side,
-so `talpid-routing`, `talpid-dns` and `talpid-core::firewall` do not need real implementations —
-same situation as Android, where they are stubs.
+a real fd that can be handed to Rust. Routes, DNS, MTU and per-app split tunnelling are all
+system-side, so `talpid-routing`, `talpid-dns` and `talpid-core::firewall` do not need real
+implementations; same situation as Android, where they are stubs.
 
 Constraints, from the OpenHarmony guide (`en/application-dev/network/net-vpnExtension.md`):
 
@@ -87,7 +88,7 @@ instead of for.
 
 ## 3. What has to be written
 
-### 3.1 Rust core — the good news and the trap
+### 3.1 Rust core
 
 The trap: for `aarch64-unknown-linux-ohos`, rustc reports
 
@@ -106,7 +107,7 @@ wrong thing at runtime, or fail on a device that has no NetworkManager.
 So the port's first real decision is a cfg policy. The workable one:
 
 - `#[cfg(any(target_os = "android", target_env = "ohos"))]` for "the OS owns routes/DNS/firewall"
-  (`talpid-routing/src/unix/android.rs` is already exactly that stub — reuse it).
+  (`talpid-routing/src/unix/android.rs` is already that stub; reuse it).
 - Keep `#[cfg(target_os = "android")]` for the genuinely JNI-shaped parts that get replaced anyway.
 
 Do not blind-sed all 350 sites; some are JNI/Java-class specific and need an ohos sibling, not a
@@ -120,30 +121,30 @@ Already solved upstream, use as-is:
 - `libc` treats `target_env = "ohos"` as musl-like; `nix` guards musl/ohos together.
 - `aws-lc-sys` has `configure_open_harmony()`, reads `OHOS_NDK_HOME` or `OHOS_SDK_NATIVE`, maps
   `aarch64-unknown-linux-ohos` → `OHOS_ARCH=arm64-v8a`. So `rustls`, `tokio-rustls` and
-  `mullvad-api` can build. **`ring` has no ohos path** — build `gotatun` with `aws-lc-rs`
+  `mullvad-api` can build. **`ring` has no ohos path**, so build `gotatun` with `aws-lc-rs`
   (its default), never the `ring` feature. Needs `cmake` installed; the NDK is already here.
 
 Then:
 
 - `talpid-tunnel/src/tun_provider/android/` (JNI `TalpidVpnService.prepareTun`/`bypass`) needs an
   `ohos/` sibling: a `ThreadsafeFunction` into ArkTS to call `vpnExtension.create()`, plus the
-  `protect` callback for the WireGuard UDP socket — which the daemon gets from the same shim.
+  `protect` callback for the WireGuard UDP socket, which the daemon gets from the same shim.
   `mullvad-jni` is only 510 lines; a `mullvad-napi` of similar size is the whole native boundary.
 - Skip gRPC. On Android the Kotlin UI talks to the in-process daemon over gRPC-on-UDS; on
-  HarmonyOS the UI and the VPN are different processes, so you need *some* IPC — but it does not
+  HarmonyOS the UI and the VPN are different processes, so some IPC is required, but it does not
   have to be gRPC. Either keep `mullvad-management-interface` over a unix socket and write a small
   NAPI client (no ArkTS protobuf work), or expose the `DaemonCommandChannel` directly as NAPI and
   let the UI-process shim forward over a local socket.
 - `mullvad-paths` needs the app's `filesDir` injected at init (Android does the same through
   `AndroidContext`); the rest of the daemon config is portable.
 
-### 3.2 ArkTS shell — a rewrite, not a port
+### 3.2 ArkTS shell: a rewrite
 
 `android/` is 1187 Kotlin files / ~89k lines, Compose UI, Hilt, Play billing, Android Keystore,
-`ConnectivityManager`. None of it exists on HarmonyOS. What you need is a client that speaks the
-same daemon API: account login (account number → device + WireGuard key), relay list, location
+`ConnectivityManager`. None of it exists on HarmonyOS. The client has to speak the same daemon
+API: account login (account number → device + WireGuard key), relay list, location
 picker, connect/disconnect, settings (DNS, kill switch, split tunnel, obfuscation, multihop),
-status. That is where the bulk of the code you write lives, and it is ordinary app work.
+status. That is where most of the code lives, and it is ordinary app work.
 
 Equivalent platform pieces:
 
@@ -153,12 +154,12 @@ Equivalent platform pieces:
 | `ConnectivityManager` callbacks     | `@ohos.net.connection`                                  |
 | DataStore / Room                   | `@ohos.data.preferences` / relational store             |
 | Foreground service + notification   | continuous task (`backgroundTaskManager`) + `statusBarManager` |
-| `PackageManager` (app list)         | **not available** — see gaps                            |
+| `PackageManager` (app list)         | **not available**, see gaps                             |
 
 ### 3.3 Gaps no amount of code fixes
 
 - **Always-on / start at boot.** No public API for a third-party VPN. The extension is started by
-  your app; if your app process dies, the system drops the VPN. You hold it with a continuous
+  the app; if the app process dies, the system drops the VPN. It is held with a continuous
   background task, which is why the one existing HarmonyOS VPN demo
   ([etohos](https://github.com/collaborative-creation/etohos), EasyTier) holds a *location*
   subscription to keep the process alive. That is a review-liability hack, not a design.
@@ -170,12 +171,12 @@ Equivalent platform pieces:
   engineering one; assume sideload with a developer certificate. Shipping on AppGallery
   (overseas) means a VPN qualification review. Also: the app is GPL-3.0-or-later, so a distributed
   port must publish its source.
-- **No control-center tile, no unremovable custom notification.** See 3.4 — both are platform
+- **No control-center tile, no unremovable custom notification.** See 3.4; both are platform
   limitations, not omissions in the plan.
 - DAITA, obfuscation (shadowsocks/udp-over-tcp), multihop and custom DNS live in Rust and come for
-  free once the core builds — they are not gaps, they are just untested.
+  free once the core builds; they are not gaps, only untested.
 - **Android-in-a-box containers (EasyAbroad, DroidTong) bypass the host VPN.** Verified on device:
-  with our tunnel up and moving traffic, Brave inside EasyAbroad reports the tablet's own Chinese
+  with the tunnel up and moving traffic, Brave inside EasyAbroad reports the tablet's own Chinese
   IPv6 (`2403:ac00:b201:…`) on `ifconfig.me`, not a Mullvad exit. The container runs its own
   network stack (`ancowlan0`, 192.168.124.0/24) and re-originates sockets with marks that opt out
   of VPN routing, so nothing a host-level VPN does can capture it. YouTube inside those containers
@@ -200,15 +201,15 @@ Both asked-for surfaces exist, but neither maps to the Android component.
 user is unable to swipe away. The only unremovable notification is the continuous task's, and
 `ContinuousTaskRequest` (`@ohos.resourceschedule.backgroundTaskManager.d.ts:70`) exposes only
 `backgroundTaskModes`, `backgroundTaskSubmodes`, `wantAgent`, `combinedTaskNotification`,
-`continuousTaskId` — no title, no text, no buttons. The system draws it; `wantAgent` decides where
+`continuousTaskId`, and no title, text or buttons. The system draws it; `wantAgent` decides where
 a tap lands. It also must be requested **from a UIAbility** ("Continuous tasks can be requested
 only by the UIAbility in the stage model"), which fits the rule that the VPN dies when the process
 that called `startVpnExtensionAbility` exits: the UI process holds the task.
 
 So "permanent notification" is really two: the system's continuous-task card (unremovable, no
-controls, tap → app) and a normal notification you publish and re-publish on every state change,
+controls, tap → app) and a normal notification published and re-published on every state change,
 carrying the buttons. The continuous task itself needs a `backgroundModes` claim in
-`module.json5`, and the enum has no `vpn` — `taskKeeping` and `dataTransfer` are the plausible
+`module.json5`, and the enum has no `vpn`; `taskKeeping` and `dataTransfer` are the plausible
 ones, both reviewed by Huawei, and a rejected mode surfaces as
 `9800005 - Continuous task verification failed` rather than as a compile error. Note that
 `requestAuthFromUser` / `specialScenarioProcessing` exists but puts a consent dialog in front of
@@ -229,7 +230,7 @@ const request: notificationManager.NotificationRequest = {
 
 `NotificationActionButton.wantAgent` (`notification/notificationActionButton.d.ts`) is executed by
 the system, and `WantAgent` supports `OperationType.SEND_COMMON_EVENT`, so a button does not have
-to raise the UI — it publishes an in-app common event that the VPN process subscribes to. That is
+to raise the UI; it publishes an in-app common event that the VPN process subscribes to. That is
 the cheapest control path, and it is exactly what the widget needs too.
 
 **The tile.** There is no `TileService` equivalent: the API 26 SDK contains no control-center or
@@ -239,12 +240,12 @@ same question keeps coming up on Huawei's developer forum
 to point at, so treat the control center as closed to third-party apps. The two things that do
 exist:
 
-- **Service widget** — a `form` extension ability (`FormExtensionAbility` plus a form config
+- **Service widget**: a `form` extension ability (`FormExtensionAbility` plus a form config
   profile referenced from `module.json5`), 1x1 or 2x1, with buttons that call
   `postCardAction({ action: 'message', params })`; the payload arrives in the widget's
   `onFormEvent`, which then publishes the same common event. This is the closest thing to a tile
-  and it is the one I'd build.
-- **Icon shortcut** — `shortcuts` in `module.json5` plus `shortcutManager` (API 20+): long-press
+  and it is the practical choice.
+- **Icon shortcut**: `shortcuts` in `module.json5` plus `shortcutManager` (API 20+): long-press
   the app icon → "Connect" / "Disconnect". Entries are `want`s, so they open an ability; keep the
   trampoline page that reads the parameter thin and finish it immediately.
 
@@ -266,10 +267,10 @@ Two things this forces into M1 rather than later: the daemon must expose state c
 
 ## 4. Order of work
 
-Deliberately no durations: the order is by dependency, and each milestone closes when a condition
+There are no durations: the order is by dependency, and each milestone closes when a condition
 holds, not when a date arrives.
 
-**M0 — the pipe exists on the device.**
+**M0: the pipe exists on the device.**
 `VpnExtensionAbility` + `vpnExtension.create` → fd → `tun` crate → `gotatun` → one ping through a
 real relay.
 *Closes when:* a handshake completes, traffic leaves through the relay while the UI process is
@@ -278,24 +279,24 @@ alive, and the tunnel tears down cleanly.
 **Half of M0 is verified on the tablet (2026-10-18, MatePad TGR-W00, API 24).** With the scaffold
 in `app/`: the consent dialog appears, `VpnConnection.create` returns an fd, the Rust `tun` crate's
 `ohos` backend reads it, the 0.0.0.0/0 route captures packets, and `VpnConnection.protect(26)`
-succeeds on the relay socket. Still open: the actual WireGuard handshake — this build counts and
+succeeds on the relay socket. Still open: the actual WireGuard handshake. This build counts and
 drops what it captures, so nothing leaves the device yet.
 
-This is the milestone that decides whether the rest is worth doing: if `aws-lc` and the fd handoff
+This is the milestone that decides whether the rest is viable: if `aws-lc` and the fd handoff
 work, everything after it is ordinary work; if not, the design changes before any UI exists.
 
-**M1 — the Rust core builds and runs headless for `aarch64-unknown-linux-ohos`.**
+**M1: the Rust core builds and runs headless for `aarch64-unknown-linux-ohos`.**
 cfg policy for `target_env = "ohos"`, a tun provider replacing the JNI one, `mullvad-paths`
 injected from the app sandbox, NAPI boundary, daemon in-process.
 *Closes when:* connect / disconnect / status work from a test harness with no ArkTS UI.
 
-**M2 — account and relay list.**
+**M2: account and relay list.**
 `mullvad-api` as-is if aws-lc cooperates; otherwise device creation and relay fetch move to the
 ArkTS HTTP stack and only the tunnel stays in Rust. Plus the minimal UI: login, location, connect.
 *Closes when:* a fresh account number logs in, a relay is selected from the live list, and the
 connection is made with nothing hardcoded.
 
-**M3 — lifecycle and surfaces.**
+**M3: lifecycle and surfaces.**
 Continuous task from the UIAbility, the state-carrying notification with Connect/Disconnect
 buttons, the home-screen widget, icon shortcuts, reconnect on network change, kill switch, split
 tunnel, IPv6, MTU edge cases.
@@ -304,21 +305,21 @@ and a reconnection attempt after the system drops the extension; the notificatio
 daemon's real state within one state change; a button and the widget both toggle the tunnel
 without raising the UI; and the kill switch actually blocks when it should.
 
-**M4 — parity.**
+**M4: parity.**
 DNS blocking, multihop, obfuscation, DAITA, problem reports, translations.
 *Closes when:* each feature is either verified on device or explicitly descoped in this file.
 
 M0–M3 is the "usable client" line. M4 is open-ended by nature and gates nothing.
 
-## 5. If you only want the tablet on Mullvad
+## 5. Alternative: a per-device WireGuard config
 
-Mullvad's account page generates per-device WireGuard configs. If a WireGuard client exists for
-your HarmonyOS build, importing one replaces the whole port with a config file. Check that before
+Mullvad's account page generates per-device WireGuard configs. If a WireGuard client is available
+for HarmonyOS, importing one replaces the whole port with a config file. Check that before
 starting M1.
 
-## 6. Open questions worth settling before M1
+## 6. Open questions before M1
 
-1. Does the VPN extension process survive a long-lived UI process with a continuous task on your
+1. Does the VPN extension process survive a long-lived UI process with a continuous task on the
    MatePad (TGR-W00, HarmonyOS 6.1 / API 24)? That is an on-device experiment, not a doc.
 2. Are unix domain sockets usable between the UI process and the VPN extension process in the app
    sandbox? If not, the IPC design changes (shared data group, or a socketpair handed over at
@@ -340,7 +341,7 @@ starting M1.
 Required to call this a faithful port of the official client. Each item names the upstream
 behaviour it mirrors, so the work is a port and not an invention.
 
-### 7.1 Quantum resistance: ephemeral peer + PSK — **must have**
+### 7.1 Quantum resistance: ephemeral peer and PSK (must have)
 Upstream negotiates an ephemeral WireGuard peer and a preshared key *before* the tunnel opens,
 over a temporary WireGuard device, by talking to the relay's config service at `10.64.0.1`
 (`talpid-wireguard/src/ephemeral.rs`, `negotiation::negotiate_ephemeral_peers`). Default is on.
@@ -348,18 +349,18 @@ Porting it requires: the temporary device, the config-service protocol, `psk` on
 and a restart of the engine with the negotiated key/PSK. Until then the tunnel is plain
 WireGuard, which the relay accepts, but the session is not quantum resistant.
 
-### 7.2 DAITA — **must have**
+### 7.2 DAITA (must have)
 Defence against AI-guided traffic analysis. Needs the same config-service negotiation plus
 `Peer::with_daita`, constant packet sizes and decoy traffic, and the relay list's
-`features.daita` flag (already read). The settings toggle exists but is inert.
+`features.daita` flag (already read). The settings toggle only filters the relay list.
 
-### 7.3 Relay IP override — **must have**
+### 7.3 Relay IP override (must have)
 `RelayOverride { ipv4_addr_in, ipv6_addr_in }` per hostname (`relay_constraints.rs:823-877`),
 applied when building the tunnel parameters. This is the manual escape hatch for a network that
 blackholes specific relay addresses, and it is the feature that would have made this debugging
 session unnecessary.
 
-### 7.4 Custom relay — **must have**
+### 7.4 Custom relay (must have)
 `RelaySettings::CustomTunnelEndpoint`: a user-supplied host, port, public key and address that
 bypasses the relay selector entirely.
 
@@ -374,13 +375,13 @@ QUIC/MASQUE (UDP 443, TLS to `<relay>.blockerad.eu`), udp2tcp and multihop.
 
 ### 7.6 Remaining parity items
 - Multihop (entry + exit peers, extra MTU headroom).
-- Persistent notification with Connect/Disconnect and the home-screen tile.
+- Home-screen tile (service widget). The notification with Connect/Disconnect exists.
 - Per-socket `protect()` for every socket the engine creates, instead of one pre-created socket.
 - Real packet counters from peer stats in the UI (bytes already wired).
 - DNS content-blocking bitmask (`100.64.0.x` resolver encoding) and custom DNS.
 - Sigsum verification of the relay list (currently accepted unsigned, like upstream's fallback).
 - Server list as country → city → relay tree, with filter chips and custom lists.
-- Kill switch implemented as `isBlocking` plus route policy, not just a toggle.
+- Kill switch: `isBlocking` is set; route policy for the down state is not implemented.
 - Latency-aware "Automatic": today the client prefers countries already used and then a
   random sample, so it can land on a relay on the other side of the planet. Measure the
   handshake time per candidate and keep a per-country score, like the official client's
@@ -404,7 +405,7 @@ Ordered by what the user feels first, not by what is easiest. Each item is sized
 
 ### 8.2 Server browser
 - Replace the inline-expanding country rows with a real drill-down: country → city → relay,
-  with the relay you are on pinned at the top and marked.
+  with the current relay pinned at the top and marked.
 - Filter chips: DAITA, owned, recent, and (later) providers.
 - Favourites and a user-ordered custom list, stored like `recents`.
 - Search across country/city/hostname with result grouping, and keep the query when navigating
@@ -412,12 +413,10 @@ Ordered by what the user feels first, not by what is easiest. Each item is sized
 - Usage map shown per country as a small sparkline rather than "used 8×".
 
 ### 8.3 Settings that do what they say
-- **Kill switch**: currently a toggle that only sets `isBlocking`. Either implement it (route
-  policy + block on drop) or remove the switch; a lying toggle is worse than none.
-- **Protocol preference**: let the user pin the transport ladder (Automatic / WireGuard only /
-  obfuscated only) — needed on networks where one path is always better.
+- **Kill switch**: sets `isBlocking` while the tunnel is up. Verify on device that blocking holds
+  while the tunnel is down, and add route policy if it does not.
 - **MTU**: expose it (1280/1360/1420), since container and mobile networks differ.
-- **Per-app routing**: exclude chosen bundles from the tunnel — the only way to make
+- **Per-app routing**: exclude chosen bundles from the tunnel, the only way to make
   Android-in-a-box containers usable with this client.
 - **DNS content blocking**: the resolver bitmask (ads/trackers/malware/adult/gambling/social)
   needs the backend first; UI after.
@@ -438,4 +437,4 @@ Ordered by what the user feels first, not by what is easiest. Each item is sized
   unlabelled for screen readers today).
 - Empty/loading/error states for every list.
 - **About / licences screen**: GPL-3.0 source offer, third-party notices, version and build.
-  Required before any binary leaves your hands.
+  Required before distributing a binary.
