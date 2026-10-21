@@ -1713,7 +1713,8 @@ struct Index {
             .fontColor($r('sys.color.font_primary'))
           Text('There are no terms of service: this is not a service. The app is provided as is, ' +
             'under the GPL-3.0-or-later licence, and based on the open-source client from ' +
-            'mullvad/mullvadvpn-app.')
+            'mullvad/mullvadvpn-app. Your Mullvad account is governed by Mullvad\'s terms, not by ' +
+            'this app.')
             .fontSize(14)
             .lineHeight(21)
             .fontColor($r('sys.color.font_secondary'))

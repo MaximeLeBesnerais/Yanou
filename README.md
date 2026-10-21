@@ -317,6 +317,19 @@ cache is reused for 24 hours, and a missing field forces a refresh.
 | `sys.symbol.square_on_square` not found | symbol names differ from the Android and iOS sets | use a symbol that exists in the SDK table, for example `doc_text_on_doc_text` |
 | Healthy tunnel reported as "Connection lost" after backgrounding | the UI watchdog treated suspended broadcasts as silence | track `onPageShow` and `onPageHide`, and allow five seconds after resume |
 
+## Legal
+
+The app is distributed under GPL-3.0-or-later and comes with no warranty; [`LICENSE`](LICENSE)
+is the whole agreement. There are no terms of service, because there is no service to agree
+to.
+
+Your Mullvad account is governed by [Mullvad's terms of
+service](https://mullvad.net/en/help/terms-service), not by this project. 燕鸥 is not a party
+to that agreement.
+
+The app collects nothing. It keeps the account token in the device keystore and the WireGuard
+key in the app sandbox, and it contacts only Mullvad's API and the relay you select.
+
 ## Repository
 
 ```
