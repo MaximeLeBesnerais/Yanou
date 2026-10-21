@@ -920,65 +920,76 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
    */
   private async negotiateDaita(): Promise<void> {
     native.logLine('daita: negotiating with the relay config service');
-    const tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
-    try {
-      await tcp.connect({
-        address: { address: TUN_GATEWAY, family: 1, port: CONFIG_SERVICE_PORT },
-        timeout: 10000
-      });
-      const fd: number = await tcp.getSocketFd();
-      native.logLine(`daita: config service socket fd ${fd} (unprotected, routed into the tunnel)`);
-      const raw: string = await native.negotiateDaita(fd, this.publicKey, '');
-      const result: DaitaNegotiation = JSON.parse(raw) as DaitaNegotiation;
-      if (result.ok !== true) {
-        const message: string = result.error !== undefined ? result.error : 'unknown error';
-        native.logLine(`daita: negotiation failed · ${message}`);
-        // The user asked for DAITA by switching the toggle on; a tunnel that silently
-        // runs without it would be a privacy downgrade, so fail this connection instead.
-        this.fail(`DAITA negotiation failed: ${message}`);
-        return;
-      }
-      const machines: string[] = result.machines !== undefined && result.machines !== null ?
-        result.machines : [];
-      const maxPadding: number = result.maxPadding !== undefined ? result.maxPadding : 0;
-      const maxBlocking: number = result.maxBlocking !== undefined ? result.maxBlocking : 0;
-      if (machines.length === 0) {
-        native.logLine('daita: relay returned no machines; failing this connection');
-        this.fail('DAITA negotiation failed: the relay returned no machines. ' +
-          'Pick a DAITA relay or turn the toggle off.');
-        return;
-      }
-      const ephemeralKey: string = result.ephemeralKey !== undefined ? result.ephemeralKey : '';
-      if (ephemeralKey.length === 0) {
-        native.logLine('daita: no ephemeral key in the result; failing this connection');
-        this.fail('DAITA negotiation failed: the relay did not return an ephemeral peer key.');
-        return;
-      }
-      const psk: string = result.psk !== undefined && result.psk !== null ? result.psk : '';
-      native.logLine(`daita: relay returned ${machines.length} machine(s) · ` +
-        `maxPadding ${maxPadding} · maxBlocking ${maxBlocking} · ` +
-        `psk ${psk.length > 0 ? 'set' : 'not set'}`);
-      this.daitaPeer = {
-        psk: psk,
-        ephemeralKey: ephemeralKey,
-        machines: machines,
-        maxPadding: maxPadding,
-        maxBlocking: maxBlocking
-      };
-      this.restartWithDaita();
-    } catch (e) {
-      const err = e as BusinessError;
-      native.logLine(`daita: negotiation failed · ${err.code ?? -1}: ${err.message ?? 'unknown'}`);
-      this.fail(`DAITA negotiation failed: ${err.message ?? 'unknown error'}`);
-    } finally {
-      this.daitaPending = false;
+    // The config service drops connections for no visible reason now and then: one
+    // negotiation returns 722 bytes, the next closes the stream after ~14 s. A fresh
+    // socket and a retry is cheaper than failing the whole connection on the first try.
+    const attempts: number = 3;
+    let lastError: string = 'unknown error';
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
       try {
-        await tcp.close();
+        await tcp.connect({
+          address: { address: TUN_GATEWAY, family: 1, port: CONFIG_SERVICE_PORT },
+          timeout: 10000
+        });
+        const fd: number = await tcp.getSocketFd();
+        native.logLine(`daita: config service socket fd ${fd} ` +
+          `(attempt ${attempt} of ${attempts}, unprotected, routed into the tunnel)`);
+        const raw: string = await native.negotiateDaita(fd, this.publicKey, '');
+        const result: DaitaNegotiation = JSON.parse(raw) as DaitaNegotiation;
+        if (result.ok !== true) {
+          lastError = result.error !== undefined ? result.error : 'unknown error';
+          native.logLine(`daita: attempt ${attempt} failed · ${lastError}`);
+        } else {
+          const machines: string[] = result.machines !== undefined && result.machines !== null ?
+            result.machines : [];
+          const maxPadding: number = result.maxPadding !== undefined ? result.maxPadding : 0;
+          const maxBlocking: number = result.maxBlocking !== undefined ? result.maxBlocking : 0;
+          const ephemeralKey: string = result.ephemeralKey !== undefined ?
+            result.ephemeralKey : '';
+          if (machines.length === 0) {
+            lastError = 'the relay returned no machines';
+            native.logLine(`daita: attempt ${attempt} failed · ${lastError}`);
+          } else if (ephemeralKey.length === 0) {
+            lastError = 'the relay did not return an ephemeral peer key';
+            native.logLine(`daita: attempt ${attempt} failed · ${lastError}`);
+          } else {
+            const psk: string = result.psk !== undefined && result.psk !== null ? result.psk : '';
+            native.logLine(`daita: relay returned ${machines.length} machine(s) · ` +
+              `maxPadding ${maxPadding} · maxBlocking ${maxBlocking} · ` +
+              `psk ${psk.length > 0 ? 'set' : 'not set'}`);
+            this.daitaPeer = {
+              psk: psk,
+              ephemeralKey: ephemeralKey,
+              machines: machines,
+              maxPadding: maxPadding,
+              maxBlocking: maxBlocking
+            };
+            this.daitaPending = false;
+            this.restartWithDaita();
+            return;
+          }
+        }
       } catch (e) {
         const err = e as BusinessError;
-        hilog.warn(DOMAIN, TAG, 'daita socket close: %{public}d', err.code ?? -1);
+        lastError = `${err.code ?? -1}: ${err.message ?? 'unknown'}`;
+        native.logLine(`daita: attempt ${attempt} failed · ${lastError}`);
+      } finally {
+        try {
+          await tcp.close();
+        } catch (e) {
+          const err = e as BusinessError;
+          hilog.warn(DOMAIN, TAG, 'daita socket close: %{public}d', err.code ?? -1);
+        }
+      }
+      if (attempt < attempts) {
+        await this.delay(1000);
       }
     }
+    // DAITA was asked for by switching the toggle on; a tunnel that silently runs
+    // without it would be a privacy downgrade, so fail this connection instead.
+    this.daitaPending = false;
+    this.fail(`DAITA negotiation failed: ${lastError}`);
   }
 
   /**
