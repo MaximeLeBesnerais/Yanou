@@ -60,6 +60,8 @@ scam.
   content, gambling, social media), or your own resolvers.
 - Multihop: an entry relay and a separate exit relay, with the exit chosen from the same
   server browser.
+- DAITA: constant packet sizes, decoy traffic and pacing, using the machines the relay's
+  config service hands out, over an ephemeral peer.
 - Kill switch, which enables the system blocking mode. It is forced on when a family is
   excluded.
 - Continuous background task and a status notification with Disconnect and Reconnect
@@ -67,10 +69,10 @@ scam.
 - Automatic rekey before the WireGuard session expires, and watchdogs for a stalled tunnel.
 - Diagnostics: one log section per connection attempt, viewable in the app and exportable.
 
-Not implemented: DAITA (in progress; the switch currently only filters the relay list to
-relays that advertise support) and per-application tunnelling, which HarmonyOS does not
-allow a normal app to offer because it cannot enumerate installed applications.
-[`PORT-PLAN.md`](PORT-PLAN.md) section 7 has the plan and the unit breakdown for both.
+Not implemented: post-quantum keys (the config service only returns a PSK when a KEM
+exchange is requested, and only DAITA is negotiated), and per-application tunnelling, which
+HarmonyOS does not allow a normal app to offer because it cannot enumerate installed
+applications. [`PORT-PLAN.md`](PORT-PLAN.md) section 7 has the plan and the unit breakdown.
 
 ## Requirements
 
