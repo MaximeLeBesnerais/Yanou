@@ -20,11 +20,17 @@ Connect with the default settings (IPv4 only, kill switch on, automatic protocol
 
 ## 2. Content blocking
 
-Settings → DNS → automatic, and switch on **Ads**.
+Settings → DNS → switch on **Ads**, connect, then tap **Check DNS** in Diagnostics.
 
-- Log: `dns: 100.64.0.1`, and the vNIC line shows that resolver.
-- Query through the tunnel: `hdc shell "ping -c1 100.64.0.1"` should not fail at the route
-  level, and an ad domain requested from the tablet's browser should be blocked.
+- Log: `dns: auto · blocking mask 1 · 100.64.0.1` (what the tunnel advertises) and
+  `dns: in-tunnel redirect to 100.64.0.1; only IPv4 DNS is redirected, IPv6 DNS passes
+  unchanged` (the core catching the queries).
+- Check DNS must fail for the ad domains and still resolve a normal one:
+  `doubleclick.net -> failed (2100002)`, `googlesyndication.com -> failed (2100002)`,
+  `example.com -> 2606:4700:…`.
+- The platform resolver is not involved: the default network still reports the Wi-Fi
+  resolvers, which is why the redirect exists. IPv6 DNS is not redirected, so a name that
+  resolves only over IPv6 DNS is not blocked.
 
 ## 3. Custom DNS
 
