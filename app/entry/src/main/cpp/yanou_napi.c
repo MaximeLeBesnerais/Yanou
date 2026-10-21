@@ -373,7 +373,9 @@ static napi_value WrapTunnelStart(napi_env env, napi_callback_info info)
     char endpoint[128] = { 0 };
     char bridge[128] = { 0 };
     char transport[32] = { 0 };
-    char settings[512] = { 0 };
+    // The settings JSON carries the DAITA machines, which are long strings: 512 B
+    // truncated it mid-string and the core rejected every attempt.
+    char settings[16384] = { 0 };
     size_t length = 0;
     if (argc >= 1) {
         napi_get_value_int32(env, argv[0], &fd);
