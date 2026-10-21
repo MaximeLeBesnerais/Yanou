@@ -152,6 +152,30 @@ function dnsChoice(prefs: VpnPrefs): DnsChoice {
 }
 
 /**
+ * The resolver the native core rewrites plaintext IPv4 DNS to, or '' when none is
+ * reachable through the tunnel.
+ *
+ * The platform resolver ignores `VpnConfig.dnsAddresses` on this build: the VPN takes the
+ * routes but not the default-network role, so content blocking has to happen in the tunnel
+ * itself. Both tunnel resolvers qualify — the default `10.64.0.1` and the blocking
+ * `100.64.0.<mask>` — as does a public custom resolver. A private custom resolver is
+ * reachable only outside the tunnel, where the core must not send queries, so it is
+ * omitted. Only IPv4 is redirected (an IPv6 DNS checksum cannot be zeroed), so an IPv6
+ * custom resolver is not usable here either.
+ */
+function dnsRedirectAddress(dns: DnsChoice): string {
+  for (const address of dns.addresses) {
+    if (address.indexOf(':') >= 0) {
+      continue;
+    }
+    if (address === TUN_DNS || !isLocalDnsAddress(address)) {
+      return address;
+    }
+  }
+  return '';
+}
+
+/**
  * A route the system must not send into the tunnel. The daemon installs the private
  * resolvers outside the tunnel (its `DnsConfig::from_addresses(.., non_tunnel_config)`);
  * here the equivalent is an excluded route for the resolver itself.
@@ -314,6 +338,8 @@ interface TransportSettings {
   token?: string;
   exit?: ExitSettings;
   sourceIpv4?: string;
+  /** Resolver for the in-tunnel plaintext IPv4 DNS redirect; absent when it is private. */
+  dns?: string;
   /** DAITA keys, present only after a successful negotiation with the relay. */
   daita?: boolean;
   psk?: string;
@@ -397,6 +423,12 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
   private lostReason: string = '';
   /** DAITA preference, read once at setup; the relay list is already filtered by it. */
   private daitaEnabled: boolean = false;
+  /**
+   * Resolver the core rewrites plaintext IPv4 DNS to, or '' when the chosen resolver is
+   * reachable only outside the tunnel. Read at setup and repeated in every attempt's
+   * settings, because the core is restarted for each candidate.
+   */
+  private dnsResolver: string = '';
   /** Settings from the config service; non-null once the tunnel carries DAITA. */
   private daitaPeer: DaitaPeerSettings | undefined = undefined;
   /** A negotiation is running, so the ticker must not start a second one. */
@@ -498,6 +530,9 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       this.daitaEnabled = prefs.daita;
       native.logLine(`daita: ${prefs.daita ? 'requested for this connection' : 'off'}`);
       const dns: DnsChoice = dnsChoice(prefs);
+      // The core cannot rely on the platform resolver here (see `dnsRedirectAddress`), so
+      // it rewrites plaintext IPv4 DNS inside the tunnel to this address.
+      this.dnsResolver = dnsRedirectAddress(dns);
       const addresses: vpnExtension.LinkAddress[] = [
         { address: { address: tunAddress, family: 1 }, prefixLength: tunPrefix }
       ];
@@ -542,10 +577,9 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       }
 
       // The blocking resolver sits in 100.64.0.0/10, a range the system tends to treat
-      // like a private network and keep off the VPN. A host route per resolver is meant to
-      // pin it to the tunnel; it has not changed the observed behaviour yet (queries still
-      // resolve through the physical DNS), so this stays as the routing half of the fix
-      // while the resolver reachability is investigated.
+      // like a private network and keep off the VPN. A host route per resolver pins it to
+      // the tunnel; the actual blocking happens in the core, which rewrites plaintext
+      // IPv4 DNS to the resolver because the platform resolver ignores `dnsAddresses`.
       for (const address of dns.addresses) {
         if (isLocalDnsAddress(address)) {
           continue;
@@ -734,6 +768,12 @@ export default class YanouVpnAbility extends VpnExtensionAbility {
       // The exit device synthesizes IPv4 packets, so their source has to be the address
       // the entry relay knows belongs to this device, not the 10.64.0.1 gateway.
       settings.sourceIpv4 = this.sourceIpv4();
+    }
+    // The core rewrites plaintext IPv4 DNS inside the tunnel to this resolver. Absent for
+    // a private custom resolver, which is reachable only outside the tunnel and must stay
+    // there.
+    if (this.dnsResolver.length > 0) {
+      settings.dns = this.dnsResolver;
     }
     // DAITA is added to this once-only settings object after a successful negotiation,
     // so every attempt the restart makes carries the same ephemeral peer.

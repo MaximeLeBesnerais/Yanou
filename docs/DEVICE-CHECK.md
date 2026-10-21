@@ -43,38 +43,39 @@ Settings → enable **Multihop**, then pick an **Exit relay** from the server br
   then `tunnel: multihop handshake confirmed on both devices`.
 - A large transfer (a file download) must not stall.
 
-## 4b. DNS on the wire (open)
+## 4b. DNS on the wire
 
-The resolver reaches `VpnConfig.dnsAddresses` and answers through the tunnel, but the system
-resolver does not use it.
+The platform resolver does not use `VpnConfig.dnsAddresses` on this build: the VPN takes
+the routes but not the default-network role, so `connection.getAddressesByName` keeps
+asking the Wi-Fi resolvers. Content blocking is therefore enforced in the core, not by the
+platform: `dns.rs` rewrites every plaintext IPv4 UDP query to the tunnel resolver and
+rewrites the reply back to the address the app dialled, whichever resolver it chose.
 
-Evidence, all from one connected session with blocking on:
+Connect with blocking on and look for:
+
+- `dns: in-tunnel redirect to 100.64.0.1; only IPv4 DNS is redirected, IPv6 DNS passes
+  unchanged`
+- `dns check: 100.64.0.1:53 -> 33 B` for any resolver on the wire, and the ad domain
+  answers NXDOMAIN even though the app asked its Wi-Fi resolver.
+
+The default resolver logs `10.64.0.1` instead of the blocking address; a public custom
+resolver logs its own address. A private custom resolver is deliberately omitted by the
+extension, so the core logs `dns: no resolver for the in-tunnel redirect ...`: that
+resolver is reachable only outside the tunnel. IPv6 DNS is not redirected (a zero UDP
+checksum is illegal in IPv6), so an IPv6-only custom resolver bypasses the redirect.
+
+The measured platform behaviour, from one connected session with blocking on:
 
 ```
-dns: auto · blocking mask 1 · 100.64.0.1      ← what the tunnel advertises
+dns: auto · blocking mask 1 · 100.64.0.1      ← what the tunnel advertised
 dns check: 10.64.0.1:53   -> 129 B            ← default resolver answers
 dns check: 100.64.0.1:53  -> 33 B             ← blocking resolver answers, NXDOMAIN
 dns check: doubleclick.net -> 2404:6800:…     ← connection.getAddressesByName ignores both
-```
-
-So the tunnel side is correct: a raw unprotected UDP query to the resolver gets the blocked
-answer. `connection.getAddressesByName`, the app's own resolver path, still returns a real
-address.
-
-The reason is now measured, not guessed:
-
-```
 dns check: default net 219 dnses [202.113.15.2, 202.113.5.6, 2001:250:400:659::3]
 ```
 
-The default network still carries the Wi-Fi resolvers. The VPN takes the routes but not the
-default-network role, so netmanager answers lookups from the physical network's DNS and
-`VpnConfig.dnsAddresses` is never consulted.
-
-Next avenues, in order: check whether netmanager requires the resolver to be added to a
-"network" rather than to the VPN config on this build; try `isInternal`; and if neither works,
-carry DNS blocking in the tunnel itself (intercept port 53 in the core) rather than relying on
-the platform resolver.
+The default network carrying the Wi-Fi resolvers is why the resolver had to move into the
+tunnel: `VpnConfig.dnsAddresses` is never consulted.
 
 ## 5. DAITA
 
